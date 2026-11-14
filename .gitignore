@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+*.db
+*.sqlite
+*.csv
+private/
+alibi_out/
+specs/
+plans/
+evidence/
+backups/
