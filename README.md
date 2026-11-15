@@ -2,7 +2,7 @@
 
 Configurable public charity registry website-surface OSINT scanner, authoritative IANA RDAP verifier, Wayback CDX profiler, and research state tracker.
 
-Paired with [`ngo-mail-catch`](../ngo-mail-catch) (Track Beta: registry contact-domain parser and unified correlation dashboard) via the `ngo-recon-bridge/v1` contract.
+Paired with [`ngo-mail-catch`](https://github.com/rrddngtnn/ngo-mail-catch) (Track Beta: registry contact-domain parser and unified correlation dashboard) via the `ngo-recon-bridge/v1` contract.
 
 ## Install
 
@@ -28,9 +28,16 @@ python3 -m ngo_domain_claim.cli --config private/alpha.toml rdap-check --domain 
 # Probe Wayback Machine CDX snapshots & extract archived org metadata
 python3 -m ngo_domain_claim.cli --config private/alpha.toml wayback-probe --limit 5
 python3 -m ngo_domain_claim.cli --config private/alpha.toml snapshot-pull --limit 5
+python3 -m ngo_domain_claim.cli --config private/alpha.toml taint-audit
+python3 -m ngo_domain_claim.cli --config private/alpha.toml wayback-mirror --target example.org
 
 # Run multi-signal resurrection / twin / rebrand watch
 python3 -m ngo_domain_claim.cli --config private/alpha.toml watch --target example.org --rebrand-web
+
+# Verify live DNS (A/MX/SPF/DMARC) + HTTPS/About readiness, rank, and track stages
+python3 -m ngo_domain_claim.cli --config private/alpha.toml preflight --domain example.org --email contact@example.org
+python3 -m ngo_domain_claim.cli --config private/alpha.toml rank --limit 20
+python3 -m ngo_domain_claim.cli --config private/alpha.toml status
 
 # Export bridge snapshot for Track Beta correlation
 python3 -m ngo_domain_claim.cli --config private/alpha.toml export-bridge
