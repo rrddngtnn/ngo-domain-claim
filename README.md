@@ -1,24 +1,41 @@
 # ngo-domain-claim (Track Alpha)
 
-Public registry website surface telemetry, DNS/RDAP availability tracking, Wayback CDX snapshot indexing, and candidate scoring for LMIC nonprofit research.
+Configurable public charity registry website-surface OSINT scanner, authoritative IANA RDAP verifier, Wayback CDX profiler, and research state tracker.
 
-Paired with [`ngo-mail-catch`](../ngo-mail-catch) (Track Beta: registry contact-domain analysis and unified cross-track correlation) via the `ngo-recon-bridge/v1` JSON handoff schema.
+Paired with [`ngo-mail-catch`](../ngo-mail-catch) (Track Beta: registry contact-domain parser and unified correlation dashboard) via the `ngo-recon-bridge/v1` contract.
+
+## Install
+
+```bash
+python3 -m pip install -e ".[dev]"
+cp alpha.example.toml private/alpha.toml
+```
 
 ## Quickstart
 
 ```bash
 export PYTHONPATH=packages
 
-# Import verified scan results
-python3 -m ngo_domain_claim.cli import-scan --file ../final.json
+# Inspect resolved config and SQLite readiness
+python3 -m ngo_domain_claim.cli --config private/alpha.toml doctor
 
-# View pipeline summary and top-ranked candidates
-python3 -m ngo_domain_claim.cli status
-python3 -m ngo_domain_claim.cli rank --limit 15
+# Run automated scan (source -> DNS A/MX/NS -> IANA RDAP -> SQLite)
+python3 -m ngo_domain_claim.cli --config private/alpha.toml scan
 
-# Probe Wayback Machine CDX snapshots for top candidates
-python3 -m ngo_domain_claim.cli wayback-probe --limit 5
+# Check a single domain against authoritative IANA RDAP bootstrap
+python3 -m ngo_domain_claim.cli --config private/alpha.toml rdap-check --domain example.org
+
+# Probe Wayback Machine CDX snapshots & extract archived org metadata
+python3 -m ngo_domain_claim.cli --config private/alpha.toml wayback-probe --limit 5
+python3 -m ngo_domain_claim.cli --config private/alpha.toml snapshot-pull --limit 5
 
 # Export bridge snapshot for Track Beta correlation
-python3 -m ngo_domain_claim.cli export-bridge --out private/alpha_bridge.json
+python3 -m ngo_domain_claim.cli --config private/alpha.toml export-bridge
+```
+
+## Tests & hygiene gate
+
+```bash
+make test
+make hygiene
 ```

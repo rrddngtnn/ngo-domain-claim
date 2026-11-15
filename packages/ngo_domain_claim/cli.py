@@ -1,13 +1,13 @@
-"""CLI for Track Alpha: public registry website telemetry and research state tracking."""
+"""CLI for Track Alpha: configurable public registry website-surface OSINT scanner."""
 from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 import sys
 
 from ngo_domain_claim.bridge.handoff import export_bridge_snapshot
+from ngo_domain_claim.core.config import load_config
 from ngo_domain_claim.core.store import (
     STAGES,
     advance_stage,
@@ -20,24 +20,35 @@ from ngo_domain_claim.core.store import (
 )
 from ngo_domain_claim.recon.snapshot import extract_org_metadata, fetch_latest_snapshot
 from ngo_domain_claim.recon.wayback import fetch_cdx_summary
-
-
-def default_db_path() -> str:
-    return os.environ.get("ALPHA_RECON_DB", "private/alpha_claims.sqlite")
+from ngo_domain_claim.scanner.pipeline import run_scan
+from ngo_domain_claim.scanner.rdap import RdapResolver
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="ngo-domain-claim")
-    ap.add_argument("--db", default=default_db_path(), help="SQLite inventory path")
+    ap.add_argument("--config", default=None, help="Path to TOML config (overrides ALPHA_CONFIG)")
+    ap.add_argument("--db", default=None, help="SQLite inventory path (overrides ALPHA_RECON_DB / TOML)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("doctor", help="Check SQLite schema and environment readiness")
+    sub.add_parser("doctor", help="Check SQLite schema and resolved configuration")
     sub.add_parser("status", help="Show summary counts by stage and country")
 
-    p_imp = sub.add_parser("import-scan", help="Import JSON scan output into SQLite")
-    p_imp.add_argument("--file", required=True, help="Path to final.json or cands.json")
+    p_scan = sub.add_parser("scan", help="Run automated OSINT scan via configured source + DNS + IANA RDAP")
+    p_scan.add_argument("--source-kind", default=None, choices=["rest_directory", "json_file", "csv_file"])
+    p_scan.add_argument("--base-url", default=None)
+    p_scan.add_argument("--file", default=None)
+    p_scan.add_argument("--countries", default=None, help="Comma-separated ISO3 codes")
+    p_scan.add_argument("--max-pages", type=int, default=None)
+    p_scan.add_argument("--no-doh", action="store_true", help="Disable DoH MX/NS verification")
+    p_scan.add_argument("--dry-run", action="store_true")
 
-    p_rank = sub.add_parser("rank", help="List top-scored research candidates")
+    p_rdap = sub.add_parser("rdap-check", help="Check one domain via authoritative IANA RDAP bootstrap")
+    p_rdap.add_argument("--domain", required=True)
+
+    p_imp = sub.add_parser("import-scan", help="Import normalized JSON scan output into SQLite")
+    p_imp.add_argument("--file", required=True, help="Path to JSON array file")
+
+    p_rank = sub.add_parser("rank", help="List top-scored candidates")
     p_rank.add_argument("--limit", type=int, default=20)
     p_rank.add_argument("--iso", default=None, help="Filter by ISO3 country code")
     p_rank.add_argument("--stage", default=None, help="Filter by stage")
@@ -46,31 +57,75 @@ def main(argv: list[str] | None = None) -> int:
     p_wb.add_argument("--limit", type=int, default=5)
     p_wb.add_argument("--target", default=None, help="Specific root_domain or gs_id")
 
-    p_adv = sub.add_parser("set-stage", help="Update research stage for a candidate")
-    p_adv.add_argument("--target", required=True, help="root_domain or gs_id")
-    p_adv.add_argument("--stage", required=True, choices=STAGES)
-    p_adv.add_argument("--notes", default=None)
-
-    p_exp = sub.add_parser("export-bridge", help="Export shared bridge JSON for Track Beta correlation")
-    p_exp.add_argument("--out", default="private/alpha_bridge.json")
-
-    p_snap = sub.add_parser("snapshot-pull", help="Pull latest archived HTML and extract director/mission metadata")
+    p_snap = sub.add_parser("snapshot-pull", help="Pull latest archived HTML and extract org metadata")
     p_snap.add_argument("--limit", type=int, default=5)
     p_snap.add_argument("--target", default=None, help="root_domain or gs_id")
 
     p_meta = sub.add_parser("show-meta", help="Show extracted snapshot metadata for a target")
     p_meta.add_argument("--target", required=True)
 
+    p_adv = sub.add_parser("set-stage", help="Update lifecycle stage for a candidate")
+    p_adv.add_argument("--target", required=True, help="root_domain or gs_id")
+    p_adv.add_argument("--stage", required=True, choices=STAGES)
+    p_adv.add_argument("--notes", default=None)
+
+    p_exp = sub.add_parser("export-bridge", help="Export shared bridge JSON for Track Beta correlation")
+    p_exp.add_argument("--out", default=None)
+
     args = ap.parse_args(argv)
-    db = open_db(args.db)
+    overrides: dict[str, object] = {}
+    if args.db:
+        overrides["db"] = args.db
+    if args.cmd == "scan":
+        if args.source_kind:
+            overrides["source_kind"] = args.source_kind
+        if args.base_url:
+            overrides["base_url"] = args.base_url
+        if args.file:
+            overrides["file"] = args.file
+        if args.countries:
+            overrides["countries"] = [c.strip().upper() for c in args.countries.split(",") if c.strip()]
+        if args.max_pages is not None:
+            overrides["max_pages"] = args.max_pages
+        if args.no_doh:
+            overrides["enable_doh"] = False
+
+    cfg = load_config(args.config, cli_overrides=overrides)
+    db = open_db(cfg.db_path)
 
     if args.cmd == "doctor":
         summary = status_summary(db)
-        print(json.dumps({"ok": True, "db": args.db, "total_targets": summary["total_targets"]}, indent=2))
+        print(json.dumps({
+            "ok": True,
+            "db_path": cfg.db_path,
+            "bridge_out": cfg.bridge_out,
+            "source_kind": cfg.source.kind,
+            "source_configured": bool(cfg.source.base_url or cfg.source.file_path),
+            "doh_enabled": cfg.probe.enable_doh,
+            "iana_bootstrap_url": cfg.probe.iana_bootstrap_url,
+            "total_targets": summary["total_targets"],
+        }, indent=2))
         return 0
 
     if args.cmd == "status":
         print(json.dumps(status_summary(db), indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "scan":
+        report = run_scan(cfg, db, dry_run=args.dry_run)
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "rdap-check":
+        resolver = RdapResolver(
+            bootstrap_url=cfg.probe.iana_bootstrap_url,
+            cache_path=cfg.probe.rdap_cache_path,
+            cache_ttl_s=cfg.probe.rdap_cache_ttl_s,
+            extra_servers=cfg.probe.extra_rdap_servers,
+            timeout_s=cfg.probe.timeout_s,
+            user_agent=cfg.user_agent,
+        )
+        print(json.dumps(resolver.check_domain(args.domain), indent=2))
         return 0
 
     if args.cmd == "import-scan":
@@ -145,17 +200,6 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(results, indent=2))
         return 0
 
-    if args.cmd == "set-stage":
-        updated = advance_stage(db, args.target, args.stage, notes=args.notes)
-        print(json.dumps({
-            "gs_id": updated["gs_id"],
-            "root_domain": updated["root_domain"],
-            "stage": updated["stage"],
-            "score": updated["score"],
-            "notes": updated["notes"],
-        }, indent=2))
-        return 0
-
     if args.cmd == "snapshot-pull":
         if args.target:
             targets = [
@@ -199,9 +243,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(meta, indent=2, ensure_ascii=False) if meta else json.dumps({"error": "not found"}))
         return 0
 
+    if args.cmd == "set-stage":
+        updated = advance_stage(db, args.target, args.stage, notes=args.notes)
+        print(json.dumps({
+            "gs_id": updated["gs_id"],
+            "root_domain": updated["root_domain"],
+            "stage": updated["stage"],
+            "score": updated["score"],
+            "notes": updated["notes"],
+        }, indent=2))
+        return 0
+
     if args.cmd == "export-bridge":
-        payload = export_bridge_snapshot(db, args.out)
-        print(json.dumps({"out": args.out, "total": payload["total"], "exported_at": payload["exported_at"]}, indent=2))
+        out_path = args.out or cfg.bridge_out
+        payload = export_bridge_snapshot(db, out_path)
+        print(json.dumps({"out": out_path, "total": payload["total"], "exported_at": payload["exported_at"]}, indent=2))
         return 0
 
     return 1

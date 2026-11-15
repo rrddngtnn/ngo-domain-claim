@@ -206,14 +206,11 @@ def upsert_target(db: sqlite3.Connection, item: dict[str, Any]) -> bool:
         db.commit()
         return False
 
-    director_email = item.get("director_email") or f"director@{rdom}"
-    director_name = item.get("director_name") or "Dr. Samuel K. Mensah"
-    director_role = item.get("director_role") or "Executive Director"
-    mission = item.get("mission") or (
-        f"{name} is a registered non-governmental organization dedicated to community empowerment, "
-        f"public health access, educational equity, and sustainable local development in {item.get('country', 'our region')}."
-    )
-    address = item.get("address") or f"Registered Office ({reg_code} #{item.get('registryId') or item.get('registry_id')}), {item.get('country', '')}"
+    director_email = item.get("director_email")
+    director_name = item.get("director_name")
+    director_role = item.get("director_role")
+    mission = item.get("mission")
+    address = item.get("address")
 
     db.execute(
         """INSERT INTO targets(

@@ -1,0 +1,42 @@
+# Copy to private/alpha.toml (never commit private files or live credentials)
+
+[core]
+db_path = "private/alpha_claims.sqlite"
+bridge_out = "private/alpha_bridge.json"
+user_agent = "ngo-domain-claim/0.2 (public-registry-research)"
+
+[source]
+kind = "rest_directory"
+base_url = "https://directory.example.test/v1/organisations"
+auth_header = "Authorization"
+auth_prefix = ""
+token_env = "DIRECTORY_API_TOKEN"
+origin = "https://directory.example.test"
+referer = "https://directory.example.test/"
+country_param = "countryCode"
+page_param = "page"
+page_size_param = "pageSize"
+page_size = 100
+max_pages = 3
+request_delay_s = 0.35
+countries = ["BDI", "LBR", "MWI", "BTN"]
+type_filter = "nonprofit"
+require_registry = true
+require_unclaimed = true
+
+[source.field_map]
+id = "id"
+name = "name"
+iso3 = "countryCode"
+website = "website"
+claimedAt = "claimedAt"
+registryId = "registryId"
+
+[probe]
+doh_url = "https://dns.google/resolve"
+enable_doh = true
+iana_bootstrap_url = "https://data.iana.org/rdap/dns.json"
+rdap_cache_path = "private/iana_rdap_dns.json"
+rdap_cache_ttl_s = 604800
+timeout_s = 10
+workers = 8
