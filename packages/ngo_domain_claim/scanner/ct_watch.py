@@ -1,4 +1,4 @@
-"""Certificate Transparency (crt.sh) & multi-signal target resurrection / claim guard."""
+"""Certificate Transparency & multi-signal target resurrection / rebrand / claim guard."""
 from __future__ import annotations
 
 import datetime
@@ -6,39 +6,88 @@ import json
 import os
 import re
 import sqlite3
-from typing import Any
+from typing import Any, Sequence
+import urllib.error
 import urllib.parse
 import urllib.request
 
-from ngo_domain_claim.core.config import AlphaConfig
+from ngo_domain_claim.core.config import (
+    DEFAULT_FARM_ISSUERS,
+    DEFAULT_REBRAND_PHRASES,
+    AlphaConfig,
+)
 from ngo_domain_claim.core.store import record_event, utcnow
 from ngo_domain_claim.scanner.dns_probe import probe_domain_dns
 from ngo_domain_claim.scanner.rdap import RdapResolver
 
-FARM_ISSUER_KEYWORDS = (
-    "trustasia",
-    "dnspod",
-    "tencent",
-    "aliyun",
-    "digicert_cn",
-    "woTrus",
-)
+FARM_ISSUER_KEYWORDS = tuple(DEFAULT_FARM_ISSUERS)
+REBRAND_PHRASES = tuple(DEFAULT_REBRAND_PHRASES)
+
+GENERIC_ORG_WORDS = {
+    "association", "foundation", "fondation", "organization", "organisation",
+    "charity", "trust", "society", "initiative", "project", "program", "action",
+    "development", "international", "global", "national", "center", "centre",
+    "group", "committee", "council", "network", "welfare", "relief", "help",
+    "community",
+}
+
+GENERIC_ADDR_STOPWORDS = {
+    "registered", "office", "street", "avenue", "road", "lane", "drive",
+    "box", "po", "postal", "commune", "zone", "province", "district",
+    "city", "town", "village", "region", "country", "quartier", "secteur",
+}
+
+
+def _open_url(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout_s: int,
+    proxy_url: str | None = None,
+):
+    req = urllib.request.Request(url, headers=headers)
+    if proxy_url:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+        return opener.open(req, timeout=timeout_s)
+    return urllib.request.urlopen(req, timeout=timeout_s)
+
+
+def _directory_headers(cfg: AlphaConfig) -> dict[str, str]:
+    hdrs = {"User-Agent": cfg.user_agent, "Accept": "application/json"}
+    token = os.environ.get(cfg.source.token_env, "").strip()
+    if token:
+        val = f"{cfg.source.auth_prefix}{token}" if cfg.source.auth_prefix else token
+        hdrs[cfg.source.auth_header] = val
+    if cfg.source.origin:
+        hdrs["Origin"] = cfg.source.origin
+    if cfg.source.referer:
+        hdrs["Referer"] = cfg.source.referer
+    return hdrs
 
 
 def query_crtsh_history(
     domain: str,
     *,
+    ct_url_template: str = "https://crt.sh/?q={domain}&output=json",
+    farm_issuer_keywords: Sequence[str] = FARM_ISSUER_KEYWORDS,
     recent_days: int = 120,
     timeout_s: int = 15,
     user_agent: str = "ngo-domain-claim/0.2",
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
-    """Query crt.sh JSON API for TLS certificate issuance history on a domain."""
+    """Query Certificate Transparency JSON endpoint for TLS certificate issuance history."""
     dom = domain.lower().strip(".")
     q = urllib.parse.quote(dom)
-    url = f"https://crt.sh/?q={q}&output=json"
-    req = urllib.request.Request(url, headers={"User-Agent": user_agent, "Accept": "application/json"})
+    url = ct_url_template.format(domain=q)
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with _open_url(
+            url,
+            headers={"User-Agent": user_agent, "Accept": "application/json"},
+            timeout_s=timeout_s,
+            proxy_url=proxy_url,
+        ) as resp:
             rows = json.loads(resp.read().decode("utf-8", "ignore"))
     except Exception as exc:
         return {
@@ -77,7 +126,7 @@ def query_crtsh_history(
             recent_issued = False
 
     farm_ca = any(
-        any(kw.lower() in iss.lower() for kw in FARM_ISSUER_KEYWORDS)
+        any(kw.lower() in iss.lower() for kw in farm_issuer_keywords)
         for iss in issuers
     )
 
@@ -96,31 +145,18 @@ def query_crtsh_history(
 def fetch_directory_org_state(
     gs_id: str,
     cfg: AlphaConfig,
+    *,
+    proxy_url: str | None = None,
 ) -> dict[str, Any] | None:
     """Query directory single-organisation endpoint for live claimedAt and registrationActive."""
     if not cfg.source.base_url or not gs_id or gs_id.startswith("texturl_"):
         return None
     base = cfg.source.base_url.rstrip("/")
     url = f"{base}/{urllib.parse.quote(gs_id)}"
-    hdrs = {"User-Agent": cfg.user_agent, "Accept": "application/json"}
-    token = os.environ.get(cfg.source.token_env, "").strip()
-    if token:
-        val = f"{cfg.source.auth_prefix}{token}" if cfg.source.auth_prefix else token
-        hdrs[cfg.source.auth_header] = val
-    if cfg.source.origin:
-        hdrs["Origin"] = cfg.source.origin
-    if cfg.source.referer:
-        hdrs["Referer"] = cfg.source.referer
-
-    proxy_url = os.environ.get(cfg.source.proxy_env, "").strip()
-    req = urllib.request.Request(url, headers=hdrs)
+    hdrs = _directory_headers(cfg)
+    px = proxy_url if proxy_url is not None else (os.environ.get(cfg.source.proxy_env, "").strip() or None)
     try:
-        if proxy_url:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-            ctx = opener.open(req, timeout=cfg.probe.timeout_s)
-        else:
-            ctx = urllib.request.urlopen(req, timeout=cfg.probe.timeout_s)
-        with ctx as resp:
+        with _open_url(url, headers=hdrs, timeout_s=cfg.probe.timeout_s, proxy_url=px) as resp:
             payload = json.loads(resp.read().decode("utf-8", "ignore"))
         data = payload.get("data") if isinstance(payload, dict) else None
         return data if isinstance(data, dict) else None
@@ -128,45 +164,24 @@ def fetch_directory_org_state(
         return None
 
 
-
-REBRAND_PHRASES = (
-    "we've changed our name",
-    "we have changed our name",
-    "changed our name to",
-    "formerly known as",
-    "now known as",
-    "we have rebranded",
-    "rebranded as",
-    "moved to a new website",
-    "nous avons changé de nom",
-    "anciennement",
-)
-
-
 def _norm_addr(val: str | None) -> str:
     return re.sub(r"[^a-z0-9]", "", (val or "").lower())
-
-
-GENERIC_ORG_WORDS = {
-    "association", "foundation", "fondation", "organization", "organisation",
-    "charity", "trust", "society", "initiative", "project", "program", "action",
-    "development", "international", "global", "national", "center", "centre",
-    "group", "committee", "council", "network", "welfare", "relief", "help",
-}
 
 
 def check_directory_twins(
     row: dict[str, Any],
     cfg: AlphaConfig,
+    *,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     """Query directory search by distinctive org-name & address tokens to spot claimed twins/rebrands."""
     if not cfg.source.base_url:
-        return {"checked": False, "claimed_twins": []}
+        return {"checked": False, "status": "skipped_no_base_url", "claimed_twins": []}
     iso = (row.get("iso3") or "").upper()
     name = (row.get("name") or "").strip()
     gs_id = row.get("gs_id") or ""
     if not iso or not name:
-        return {"checked": False, "claimed_twins": []}
+        return {"checked": False, "status": "skipped_missing_fields", "claimed_twins": []}
 
     name_tokens = [w for w in re.split(r"[^A-Za-z0-9]+", name) if len(w) >= 4 and w.lower() not in GENERIC_ORG_WORDS]
     queries: list[str] = []
@@ -175,47 +190,43 @@ def check_directory_twins(
     else:
         queries.append(name)
 
-    # Also query distinctive locality/street token from address when available (catches full renames!)
+    country_tokens = {w.lower() for w in re.split(r"[^A-Za-z0-9]+", row.get("country") or "") if len(w) >= 3}
+    stop_words = GENERIC_ADDR_STOPWORDS | country_tokens
+
     raw_addr = row.get("address") or ""
     addr_tokens = [
         w for w in re.split(r"[^A-Za-z0-9]+", raw_addr)
-        if len(w) >= 5 and w.lower() not in {"registered", "office", "street", "avenue", "burundi", "liberia", "benin", "malawi", "bujumbura"}
+        if len(w) >= 5 and w.lower() not in stop_words
     ]
     if addr_tokens:
         queries.append(addr_tokens[0])
 
     base = cfg.source.base_url.rstrip("/")
-    hdrs = {"User-Agent": cfg.user_agent, "Accept": "application/json"}
-    token = os.environ.get(cfg.source.token_env, "").strip()
-    if token:
-        val = f"{cfg.source.auth_prefix}{token}" if cfg.source.auth_prefix else token
-        hdrs[cfg.source.auth_header] = val
-    if cfg.source.origin:
-        hdrs["Origin"] = cfg.source.origin
-    if cfg.source.referer:
-        hdrs["Referer"] = cfg.source.referer
-    proxy_url = os.environ.get(cfg.source.proxy_env, "").strip()
+    hdrs = _directory_headers(cfg)
+    px = proxy_url if proxy_url is not None else (os.environ.get(cfg.source.proxy_env, "").strip() or None)
+
+    country_param = cfg.source.country_param or "countryCode"
+    search_param = cfg.source.search_param or "query"
 
     seen_ids: set[str] = set()
     all_rows: list[dict[str, Any]] = []
+    errors: list[str] = []
     for q_str in queries[:2]:
-        url = f"{base}?{urllib.parse.urlencode({'countryCode': iso, 'query': q_str})}"
-        req = urllib.request.Request(url, headers=hdrs)
+        url = f"{base}?{urllib.parse.urlencode({country_param: iso, search_param: q_str})}"
         try:
-            if proxy_url:
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-                ctx = opener.open(req, timeout=cfg.probe.timeout_s)
-            else:
-                ctx = urllib.request.urlopen(req, timeout=cfg.probe.timeout_s)
-            with ctx as resp:
+            with _open_url(url, headers=hdrs, timeout_s=cfg.probe.timeout_s, proxy_url=px) as resp:
                 rows = json.loads(resp.read().decode("utf-8", "ignore")).get("data") or []
             for r in rows:
                 rid = r.get("id")
                 if rid and rid not in seen_ids:
                     seen_ids.add(rid)
                     all_rows.append(r)
-        except Exception:
+        except Exception as exc:
+            errors.append(str(exc))
             continue
+
+    if errors and not all_rows:
+        return {"checked": False, "status": f"error:{errors[0]}", "claimed_twins": []}
 
     row_addr = _norm_addr(raw_addr)
     addr_words = {w.lower() for w in addr_tokens}
@@ -240,7 +251,60 @@ def check_directory_twins(
                 "claimedAt": cand.get("claimedAt"),
                 "address_match": addr_match,
             })
-    return {"checked": True, "claimed_twins": claimed_twins}
+    return {"checked": True, "status": "ok", "claimed_twins": claimed_twins}
+
+
+def _extract_search_plain_text(raw_body: str, content_type: str, query_text: str) -> tuple[str, bool]:
+    """Return normalized lowercase text from JSON API or HTML SERP, plus bot-challenge flag."""
+    ct_low = content_type.lower()
+    stripped = raw_body.lstrip()
+    if "application/json" in ct_low or stripped.startswith("{") or stripped.startswith("["):
+        try:
+            payload = json.loads(raw_body)
+            items: list[Any] = []
+            if isinstance(payload, dict):
+                data_obj = payload.get("data")
+                items = (
+                    payload.get("results")
+                    or payload.get("organic")
+                    or payload.get("items")
+                    or (data_obj.get("web") if isinstance(data_obj, dict) else None)
+                    or []
+                )
+            elif isinstance(payload, list):
+                items = payload
+            parts: list[str] = []
+            for item in items:
+                if isinstance(item, dict):
+                    for key in ("title", "content", "snippet", "description", "url"):
+                        val = item.get(key)
+                        if isinstance(val, str):
+                            parts.append(val)
+            return re.sub(r"\s+", " ", " ".join(parts)).lower(), False
+        except json.JSONDecodeError:
+            pass
+
+    low_raw = raw_body.lower()
+    if (
+        "anomaly-modal" in low_raw
+        or "please complete the following challenge" in low_raw
+        or "cf-turnstile" in low_raw
+        or "unusual traffic from your computer" in low_raw
+    ):
+        return "", True
+
+    cleaned_html = re.sub(
+        r"<(?:form|script|style|title)[^>]*>.*?</(?:form|script|style|title)>",
+        " ",
+        raw_body,
+        flags=re.I | re.S,
+    )
+    cleaned_html = re.sub(r"<input[^>]*>", " ", cleaned_html, flags=re.I)
+    plain = re.sub(r"<[^>]+>", " ", cleaned_html)
+    plain = re.sub(r"\s+", " ", plain).lower()
+    if query_text.lower() in plain:
+        plain = plain.replace(query_text.lower(), " ")
+    return plain, False
 
 
 def check_rebrand_signals(
@@ -248,57 +312,104 @@ def check_rebrand_signals(
     row: dict[str, Any],
     *,
     search_url_template: str = "https://html.duckduckgo.com/html/?q={query}",
+    rebrand_phrases: Sequence[str] = REBRAND_PHRASES,
     check_web: bool = False,
     timeout_s: int = 10,
     user_agent: str = "ngo-domain-claim/0.2",
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
-    """Detect rebrand phrases in stored snapshot_meta or optional web search results."""
+    """Detect rebrand phrases in stored snapshot_meta or optional web search results (org + director)."""
     gs_id = row.get("gs_id") or ""
     name = (row.get("name") or "").strip()
-    dom = (row.get("root_domain") or "").lower().strip(".")
+    director = (row.get("director_name") or "").strip()
     reasons: list[str] = []
 
     snap = db.execute(
-        "SELECT page_title, meta_description, mission_excerpt FROM snapshot_meta WHERE gs_id=?",
+        "SELECT page_title, meta_description, mission_excerpt, director_name FROM snapshot_meta WHERE gs_id=?",
         (gs_id,),
     ).fetchone()
     if snap:
+        if not director and snap["director_name"]:
+            director = str(snap["director_name"]).strip()
         blob = " ".join(str(snap[k] or "") for k in ("page_title", "meta_description", "mission_excerpt")).lower()
-        for ph in REBRAND_PHRASES:
-            if ph in blob:
+        for ph in rebrand_phrases:
+            if ph.lower() in blob:
                 reasons.append(f"snapshot_rebrand_phrase:{ph}")
 
     web_hits: list[str] = []
-    web_status = "skipped"
-    if check_web and name:
-        q = urllib.parse.quote(f'"{name}" (formerly OR rebranded OR "changed our name")')
-        url = search_url_template.format(query=q)
-        req = urllib.request.Request(url, headers={"User-Agent": user_agent})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                if resp.status != 200:
-                    web_status = f"challenge_http_{resp.status}"
-                else:
-                    raw_html = resp.read().decode("utf-8", "ignore")
-                    if "anomaly-modal" in raw_html.lower() or "please complete the following challenge" in raw_html.lower():
-                        web_status = "bot_challenge"
-                    else:
-                        web_status = "ok"
-                        cleaned_html = re.sub(r"<(?:form|script|style|title)[^>]*>.*?</(?:form|script|style|title)>", " ", raw_html, flags=re.I | re.S)
-                        cleaned_html = re.sub(r"<input[^>]*>", " ", cleaned_html, flags=re.I)
-                        plain = re.sub(r"<[^>]+>", " ", cleaned_html)
-                        plain = re.sub(r"\s+", " ", plain).lower()
-                        low_name = name.lower()
-                        if f"formerly {low_name}" in plain or f"formerly known as {low_name}" in plain:
-                            reasons.append(f"web_formerly_named:{name}")
-                            web_hits.append(url)
-                        for ph in REBRAND_PHRASES:
-                            if ph in plain:
-                                reasons.append(f"web_rebrand_phrase:{ph}")
-        except Exception as exc:
-            web_status = f"error:{exc}"
+    web_statuses: list[str] = []
+    queries_run: list[str] = []
 
-    return {"rebrand_detected": bool(reasons), "reasons": reasons, "web_hits": web_hits, "web_status": web_status}
+    if check_web and name:
+        raw_queries = [f'"{name}" (formerly OR rebranded OR "changed our name")']
+        if director:
+            raw_queries.append(f'"{director}" ("{name}" OR rebranded OR "changed our name" OR formerly)')
+
+        low_name = name.lower()
+        low_dir = director.lower()
+        for raw_q in raw_queries:
+            queries_run.append(raw_q)
+            url = search_url_template.format(query=urllib.parse.quote(raw_q))
+            try:
+                with _open_url(
+                    url,
+                    headers={"User-Agent": user_agent, "Accept": "text/html,application/json"},
+                    timeout_s=timeout_s,
+                    proxy_url=proxy_url,
+                ) as resp:
+                    if resp.status != 200:
+                        web_statuses.append(f"challenge_http_{resp.status}")
+                        continue
+                    ctype = resp.headers.get("Content-Type", "")
+                    raw_body = resp.read().decode("utf-8", "ignore")
+                    plain, challenged = _extract_search_plain_text(raw_body, ctype, raw_q)
+                    if challenged:
+                        web_statuses.append("bot_challenge")
+                        continue
+                    web_statuses.append("ok")
+                    if f"formerly {low_name}" in plain or f"formerly known as {low_name}" in plain:
+                        if f"web_formerly_named:{name}" not in reasons:
+                            reasons.append(f"web_formerly_named:{name}")
+                        if url not in web_hits:
+                            web_hits.append(url)
+                    for ph in rebrand_phrases:
+                        ph_low = ph.lower()
+                        if ph_low in plain:
+                            tag = f"web_rebrand_phrase:{ph}"
+                            if tag not in reasons:
+                                reasons.append(tag)
+                            if url not in web_hits:
+                                web_hits.append(url)
+                    if low_dir and low_dir in plain and any(
+                        tok in plain for tok in ("changed our name", "rebrand", "new name", "now known as", "formerly")
+                    ):
+                        tag = f"web_director_rebrand:{director}"
+                        if tag not in reasons:
+                            reasons.append(tag)
+                        if url not in web_hits:
+                            web_hits.append(url)
+            except urllib.error.HTTPError as exc:
+                web_statuses.append(f"challenge_http_{exc.code}")
+            except Exception as exc:
+                web_statuses.append(f"error:{exc}")
+
+    if not web_statuses:
+        web_status = "skipped"
+    elif all(s == "ok" for s in web_statuses):
+        web_status = "ok"
+    elif any(s == "ok" for s in web_statuses):
+        web_status = "partial:" + ",".join(sorted(set(web_statuses)))
+    else:
+        web_status = web_statuses[0]
+
+    return {
+        "rebrand_detected": bool(reasons),
+        "reasons": reasons,
+        "web_hits": web_hits,
+        "web_status": web_status,
+        "queries_run": queries_run,
+        "director_checked": director or None,
+    }
 
 
 def watch_target(
@@ -309,14 +420,19 @@ def watch_target(
     resolver: RdapResolver | None = None,
     check_ct: bool = True,
     check_directory: bool = True,
-    check_rebrand: bool = False,
-    rebrand_search_template: str = "https://html.duckduckgo.com/html/?q={query}",
-    recent_cert_days: int = 120,
+    check_rebrand: bool | None = None,
+    rebrand_search_template: str | None = None,
+    recent_cert_days: int | None = None,
     use_system_dns: bool = True,
 ) -> dict[str, Any]:
-    """Run 4-signal OSINT watch on one target and update SQLite if burned or resurrected."""
+    """Run multi-signal OSINT watch on one target and update SQLite if burned or resurrected."""
     dom = row["root_domain"]
     gs_id = row["gs_id"]
+    proxy_url = os.environ.get(cfg.source.proxy_env, "").strip() or None
+    cert_days = recent_cert_days if recent_cert_days is not None else cfg.probe.recent_cert_days
+    do_web_rebrand = cfg.probe.rebrand_check_web if check_rebrand is None else check_rebrand
+    search_tpl = rebrand_search_template or cfg.probe.rebrand_search_url_template
+
     rdap = resolver or RdapResolver(
         bootstrap_url=cfg.probe.iana_bootstrap_url,
         cache_path=cfg.probe.rdap_cache_path,
@@ -350,17 +466,20 @@ def watch_target(
     if check_ct:
         ct_res = query_crtsh_history(
             dom,
-            recent_days=recent_cert_days,
+            ct_url_template=cfg.probe.ct_api_url_template,
+            farm_issuer_keywords=cfg.probe.farm_issuer_keywords,
+            recent_days=cert_days,
             timeout_s=cfg.probe.timeout_s,
             user_agent=cfg.user_agent,
+            proxy_url=proxy_url,
         )
         if ct_res.get("farm_ca_detected"):
             reasons.append(f"ct_farm_ca:{ct_res.get('latest_not_before')}")
         elif ct_res.get("recent_cert_issued"):
             reasons.append(f"ct_recent_cert:{ct_res.get('latest_not_before')}")
 
-    # Signal 4: Directory claimedAt / registrationActive / website change
-    dir_state = fetch_directory_org_state(gs_id, cfg) if check_directory else None
+    # Signal 4: Directory claimedAt / registrationActive
+    dir_state = fetch_directory_org_state(gs_id, cfg, proxy_url=proxy_url) if check_directory else None
     if dir_state:
         if dir_state.get("claimedAt"):
             reasons.append(f"directory_already_claimed:{dir_state['claimedAt']}")
@@ -368,17 +487,23 @@ def watch_target(
             reasons.append("regulator_registration_inactive")
 
     # Signal 5: Directory claimed twins + Rebrand footprint check
-    twin_res = check_directory_twins(row, cfg) if check_directory else {"checked": False, "claimed_twins": []}
+    twin_res = (
+        check_directory_twins(row, cfg, proxy_url=proxy_url)
+        if check_directory
+        else {"checked": False, "status": "skipped", "claimed_twins": []}
+    )
     for tw in twin_res.get("claimed_twins") or []:
         reasons.append(f"directory_claimed_twin:{tw['name']}({tw.get('website')})")
 
     reb_res = check_rebrand_signals(
         db,
         row,
-        search_url_template=rebrand_search_template,
-        check_web=check_web_rebrand if False else check_rebrand,
+        search_url_template=search_tpl,
+        rebrand_phrases=cfg.probe.rebrand_phrases,
+        check_web=do_web_rebrand,
         timeout_s=cfg.probe.timeout_s,
         user_agent=cfg.user_agent,
+        proxy_url=proxy_url,
     )
     reasons.extend(reb_res["reasons"])
 
@@ -405,7 +530,9 @@ def watch_target(
         "ct_farm_ca": ct_res.get("farm_ca_detected", False),
         "directory_claimed_at": dir_state.get("claimedAt") if dir_state else None,
         "registration_active": dir_state.get("registrationActive") if dir_state else None,
+        "twin_check_status": twin_res.get("status"),
         "claimed_twins": twin_res.get("claimed_twins", []),
+        "director_checked": reb_res.get("director_checked"),
         "rebrand_reasons": reb_res["reasons"],
         "rebrand_web_status": reb_res["web_status"],
     }

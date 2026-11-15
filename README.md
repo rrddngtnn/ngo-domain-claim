@@ -29,6 +29,9 @@ python3 -m ngo_domain_claim.cli --config private/alpha.toml rdap-check --domain 
 python3 -m ngo_domain_claim.cli --config private/alpha.toml wayback-probe --limit 5
 python3 -m ngo_domain_claim.cli --config private/alpha.toml snapshot-pull --limit 5
 
+# Run multi-signal resurrection / twin / rebrand watch
+python3 -m ngo_domain_claim.cli --config private/alpha.toml watch --target example.org --rebrand-web
+
 # Export bridge snapshot for Track Beta correlation
 python3 -m ngo_domain_claim.cli --config private/alpha.toml export-bridge
 ```

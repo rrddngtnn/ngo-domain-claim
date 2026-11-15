@@ -54,12 +54,14 @@ def main(argv: list[str] | None = None) -> int:
     p_pre.add_argument("--email", default=None)
     p_pre.add_argument("--name", default=None)
 
-    p_wt = sub.add_parser("watch", help="Run 4-signal OSINT guard (DNS + RDAP + crt.sh CT + Directory claimedAt)")
+    p_wt = sub.add_parser("watch", help="Run multi-signal OSINT guard (DNS + RDAP + CT + Directory + Rebrand)")
     p_wt.add_argument("--target", default=None, help="Specific root_domain or gs_id")
     p_wt.add_argument("--limit", type=int, default=5)
-    p_wt.add_argument("--no-ct", action="store_true", help="Skip crt.sh query")
-    p_wt.add_argument("--no-directory", action="store_true", help="Skip directory single-org lookup")
-    p_wt.add_argument("--rebrand-web", action="store_true", help="Query web search snippets for rebrand / formerly-known-as signals")
+    p_wt.add_argument("--no-ct", action="store_true", help="Skip Certificate Transparency query")
+    p_wt.add_argument("--no-directory", action="store_true", help="Skip directory lookup & twin search")
+    p_wt.add_argument("--rebrand-web", action="store_true", help="Query configured search endpoint for rebrand / director rename signals")
+    p_wt.add_argument("--rebrand-search-url", default=None, help="Override search URL template (must contain {query})")
+    p_wt.add_argument("--recent-cert-days", type=int, default=None, help="Flag TLS certs issued within N days")
 
     p_imp = sub.add_parser("import-scan", help="Import normalized JSON scan output into SQLite")
     p_imp.add_argument("--file", required=True, help="Path to JSON array file")
@@ -113,6 +115,14 @@ def main(argv: list[str] | None = None) -> int:
             overrides["max_pages"] = args.max_pages
         if args.no_doh:
             overrides["enable_doh"] = False
+
+    if args.cmd == "watch":
+        if args.rebrand_web:
+            overrides["rebrand_check_web"] = True
+        if args.rebrand_search_url:
+            overrides["rebrand_search_url_template"] = args.rebrand_search_url
+        if args.recent_cert_days is not None:
+            overrides["recent_cert_days"] = args.recent_cert_days
 
     cfg = load_config(args.config, cli_overrides=overrides)
     db = open_db(cfg.db_path)
@@ -173,7 +183,9 @@ def main(argv: list[str] | None = None) -> int:
                 resolver=resolver,
                 check_ct=not args.no_ct,
                 check_directory=not args.no_directory,
-                check_rebrand=args.rebrand_web,
+                check_rebrand=True if args.rebrand_web else None,
+                rebrand_search_template=args.rebrand_search_url,
+                recent_cert_days=args.recent_cert_days,
             )
             for t in targets
         ]

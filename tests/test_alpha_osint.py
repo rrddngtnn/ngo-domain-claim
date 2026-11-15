@@ -579,5 +579,135 @@ def test_rebrand_web_ignores_echoed_search_input_tags(tmp_path: Path):
         )
         assert rep["rebrand_detected"] is False
         assert rep["reasons"] == []
+        assert rep["web_status"] == "ok"
+    finally:
+        srv.shutdown()
+
+
+def test_rebrand_json_search_director_and_challenge_status(tmp_path: Path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from ngo_domain_claim.core.store import upsert_target
+    from ngo_domain_claim.scanner.ct_watch import check_directory_twins, check_rebrand_signals
+
+    seen_twin_queries: list[str] = []
+
+    class _JsonSerpAndTwinMock(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+        def do_GET(self):
+            if self.path.startswith("/serp-json?"):
+                body = json.dumps({
+                    "results": [
+                        {
+                            "title": "Bright Horizon Initiative",
+                            "content": "Founded by Jean Bosco. Formerly Old Hope Action — we have rebranded as Bright Horizon.",
+                            "url": "https://bright-horizon.example.test",
+                        }
+                    ]
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.startswith("/serp-challenge?"):
+                self.send_response(202)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<html><body>challenge</body></html>")
+                return
+            if self.path.startswith("/orgs?"):
+                seen_twin_queries.append(self.path)
+                body = json.dumps({
+                    "data": [
+                        {
+                            "id": "org_twin_custom",
+                            "name": "Bright Horizon",
+                            "website": "https://bright-horizon.example.test",
+                            "claimedAt": "2026-06-01T00:00:00Z",
+                            "address": "Rue Principale 44",
+                        }
+                    ]
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    srv = HTTPServer(("127.0.0.1", 0), _JsonSerpAndTwinMock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_port}"
+        monkeypatch.setenv("ALPHA_REBRAND_SEARCH_URL", f"{base}/serp-json?q={{query}}")
+        monkeypatch.setenv("ALPHA_REBRAND_WEB", "true")
+
+        cfg_file = tmp_path / "alpha.toml"
+        cfg_file.write_text(
+            f"""[core]
+db_path = "{tmp_path / 'db.sqlite'}"
+
+[source]
+kind = "rest_directory"
+base_url = "{base}/orgs"
+country_param = "iso"
+search_param = "q"
+""",
+            encoding="utf-8",
+        )
+        cfg = load_config(cfg_file)
+        assert cfg.probe.rebrand_check_web is True
+        assert cfg.probe.rebrand_search_url_template == f"{base}/serp-json?q={{query}}"
+
+        db = open_db(cfg.db_path)
+        upsert_target(db, {
+            "id": "org_full_rename",
+            "iso": "BEN",
+            "country": "Benin",
+            "name": "Old Hope Action",
+            "reg": "MDLG",
+            "regcode": "MDLG",
+            "registryId": "991",
+            "website": "https://old-hope.org",
+            "rdom": "old-hope.org",
+            "rdap": "AVAILABLE(404)",
+            "conf": "strong",
+            "address": "Rue Principale 44",
+        })
+        db.execute("UPDATE targets SET director_name=? WHERE gs_id=?", ("Jean Bosco", "org_full_rename"))
+        db.commit()
+        row = dict(db.execute("SELECT * FROM targets WHERE gs_id='org_full_rename'").fetchone())
+
+        # Custom country_param & search_param must be respected
+        twin = check_directory_twins(row, cfg)
+        assert twin["status"] == "ok"
+        assert len(twin["claimed_twins"]) == 1
+        assert any("iso=BEN" in p and "q=" in p for p in seen_twin_queries)
+
+        # JSON SERP + director query catches full rename
+        rep_json = check_rebrand_signals(
+            db,
+            row,
+            search_url_template=cfg.probe.rebrand_search_url_template,
+            check_web=True,
+        )
+        assert rep_json["rebrand_detected"] is True
+        assert rep_json["web_status"] == "ok"
+        assert rep_json["director_checked"] == "Jean Bosco"
+        assert len(rep_json["queries_run"]) == 2
+        assert any("web_director_rebrand:Jean Bosco" in r for r in rep_json["reasons"])
+
+        # HTTP 202 bot-challenge is reported explicitly, never masked as "ok"
+        rep_chal = check_rebrand_signals(
+            db,
+            row,
+            search_url_template=f"{base}/serp-challenge?q={{query}}",
+            check_web=True,
+        )
+        assert rep_chal["web_status"] == "challenge_http_202"
     finally:
         srv.shutdown()

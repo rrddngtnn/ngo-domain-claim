@@ -15,6 +15,7 @@ proxy_env = "ALPHA_PROXY_URL"
 origin = "https://directory.example.test"
 referer = "https://directory.example.test/"
 country_param = "countryCode"
+search_param = "query"
 page_param = "page"
 page_size_param = "pageSize"
 page_size = 100
@@ -39,5 +40,9 @@ enable_doh = true
 iana_bootstrap_url = "https://data.iana.org/rdap/dns.json"
 rdap_cache_path = "private/iana_rdap_dns.json"
 rdap_cache_ttl_s = 604800
+ct_api_url_template = "https://crt.sh/?q={domain}&output=json"
+recent_cert_days = 120
+rebrand_check_web = false
+rebrand_search_url_template = "https://html.duckduckgo.com/html/?q={query}"
 timeout_s = 10
 workers = 8

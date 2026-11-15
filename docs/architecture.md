@@ -9,6 +9,7 @@ Configuration resolves as: `CLI flags > environment variables > TOML file > defa
 1. **Source adapters (`scanner/sources.py`)**: `rest_directory`, `json_file`, `csv_file`, plus third-party `ngo_domain_claim.sources` entry points.
 2. **DNS probing (`scanner/dns_probe.py`)**: Checks system `getaddrinfo` and optional DNS-over-HTTPS (`A`, `MX`, `NS`) so domains with active mail exchangers are not misclassified as dead.
 3. **Authoritative RDAP (`scanner/rdap.py`)**: Resolves TLDs through the IANA RDAP DNS bootstrap (`data.iana.org/rdap/dns.json`) with local caching. TLDs absent from the bootstrap return `unsupported_tld` instead of false-positive availability.
+4. **Multi-signal Guard (`scanner/ct_watch.py`)**: Verifies live DNS/RDAP, Certificate Transparency issuance history, directory `claimedAt` + twin matching (via configurable `country_param` / `search_param`), and rebrand footprint checks across archived snapshots and configurable HTML/JSON search endpoints (`org` + `director_name`), reporting bot-challenge/error states explicitly.
 
 ## Bridge contract (`ngo-recon-bridge/v1`)
 

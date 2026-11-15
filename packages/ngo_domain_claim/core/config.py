@@ -32,6 +32,29 @@ DEFAULT_SKIP_HOSTS = [
 ]
 
 
+DEFAULT_FARM_ISSUERS = [
+    "trustasia",
+    "dnspod",
+    "tencent",
+    "aliyun",
+    "digicert_cn",
+    "wotrus",
+]
+
+DEFAULT_REBRAND_PHRASES = [
+    "we've changed our name",
+    "we have changed our name",
+    "changed our name to",
+    "formerly known as",
+    "now known as",
+    "we have rebranded",
+    "rebranded as",
+    "moved to a new website",
+    "nous avons changé de nom",
+    "anciennement",
+]
+
+
 @dataclass
 class SourceConfig:
     kind: str = "json_file"
@@ -43,6 +66,7 @@ class SourceConfig:
     origin: str = ""
     referer: str = ""
     country_param: str = "countryCode"
+    search_param: str = "query"
     page_param: str = "page"
     page_size_param: str = "pageSize"
     page_size: int = 100
@@ -64,6 +88,12 @@ class ProbeConfig:
     rdap_cache_path: str = "private/iana_rdap_dns.json"
     rdap_cache_ttl_s: int = 86400 * 7
     extra_rdap_servers: dict[str, str] = field(default_factory=dict)
+    ct_api_url_template: str = "https://crt.sh/?q={domain}&output=json"
+    recent_cert_days: int = 120
+    farm_issuer_keywords: list[str] = field(default_factory=lambda: list(DEFAULT_FARM_ISSUERS))
+    rebrand_search_url_template: str = "https://html.duckduckgo.com/html/?q={query}"
+    rebrand_phrases: list[str] = field(default_factory=lambda: list(DEFAULT_REBRAND_PHRASES))
+    rebrand_check_web: bool = False
     timeout_s: int = 10
     workers: int = 8
     skip_hosts: list[str] = field(default_factory=lambda: list(DEFAULT_SKIP_HOSTS))
@@ -135,6 +165,7 @@ def load_config(
         origin=os.environ.get("DIRECTORY_ORIGIN") or src_sec.get("origin", ""),
         referer=os.environ.get("DIRECTORY_REFERER") or src_sec.get("referer", ""),
         country_param=src_sec.get("country_param", "countryCode"),
+        search_param=src_sec.get("search_param", "query"),
         page_param=src_sec.get("page_param", "page"),
         page_size_param=src_sec.get("page_size_param", "pageSize"),
         page_size=int(cli.get("page_size") or src_sec.get("page_size", 100)),
@@ -148,6 +179,17 @@ def load_config(
         field_map=dict(src_sec.get("field_map", {})),
     )
 
+    rebrand_web_env = os.environ.get("ALPHA_REBRAND_WEB")
+    rebrand_check_web = (
+        bool(cli["rebrand_check_web"])
+        if cli.get("rebrand_check_web") is not None
+        else (
+            rebrand_web_env.strip().lower() in {"1", "true", "yes"}
+            if rebrand_web_env is not None
+            else bool(prb_sec.get("rebrand_check_web", False))
+        )
+    )
+
     prb = ProbeConfig(
         doh_url=os.environ.get("ALPHA_DOH_URL") or prb_sec.get("doh_url", "https://dns.google/resolve"),
         enable_doh=bool(cli.get("enable_doh") if cli.get("enable_doh") is not None else prb_sec.get("enable_doh", True)),
@@ -155,6 +197,16 @@ def load_config(
         rdap_cache_path=prb_sec.get("rdap_cache_path", "private/iana_rdap_dns.json"),
         rdap_cache_ttl_s=int(prb_sec.get("rdap_cache_ttl_s", 86400 * 7)),
         extra_rdap_servers=dict(prb_sec.get("extra_rdap_servers", {})),
+        ct_api_url_template=os.environ.get("ALPHA_CT_URL_TEMPLATE") or prb_sec.get("ct_api_url_template", "https://crt.sh/?q={domain}&output=json"),
+        recent_cert_days=int(cli.get("recent_cert_days") or prb_sec.get("recent_cert_days", 120)),
+        farm_issuer_keywords=list(prb_sec.get("farm_issuer_keywords", DEFAULT_FARM_ISSUERS)),
+        rebrand_search_url_template=(
+            cli.get("rebrand_search_url_template")
+            or os.environ.get("ALPHA_REBRAND_SEARCH_URL")
+            or prb_sec.get("rebrand_search_url_template", "https://html.duckduckgo.com/html/?q={query}")
+        ),
+        rebrand_phrases=list(prb_sec.get("rebrand_phrases", DEFAULT_REBRAND_PHRASES)),
+        rebrand_check_web=rebrand_check_web,
         timeout_s=int(cli.get("timeout") or prb_sec.get("timeout_s", 10)),
         workers=int(cli.get("workers") or prb_sec.get("workers", 8)),
         skip_hosts=list(prb_sec.get("skip_hosts", DEFAULT_SKIP_HOSTS)),
