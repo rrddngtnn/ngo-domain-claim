@@ -103,7 +103,18 @@ def mirror_clean_wayback_site(
             prio = 1
         return (prio, r[ts_idx])
 
-    ordered = sorted(data_rows, key=_rank_key, reverse=True)
+    def _is_junk_url(u: str) -> bool:
+        parsed = urllib.parse.urlparse(u)
+        p = (parsed.path or "").lower()
+        q = (parsed.query or "").lower()
+        if "/.well-known/" in p or "/wp-json/" in p or "/feed" in p:
+            return True
+        if "give-embed=" in q or "replytocom=" in q:
+            return True
+        return False
+
+    filtered_rows = [r for r in data_rows if not _is_junk_url(r[orig_idx])]
+    ordered = sorted(filtered_rows, key=_rank_key, reverse=True)
     target_dir = Path(out_dir)
     if target_dir.is_symlink():
         raise ValueError(f"Refusing symlink mirror destination: {target_dir}")
@@ -131,6 +142,12 @@ def mirror_clean_wayback_site(
             skipped_tainted += 1
             continue
 
+        low_raw = html_raw.lower()
+        if "wsidchk" in low_raw or "one moment, please" in low_raw or "just a moment..." in low_raw:
+            skipped_tainted += 1
+            continue
+        if len(html_raw) < 3500:
+            continue
         cleaned = clean_wayback_html(html_raw, root_domain=dom)
         dest_file = target_dir / rel
         dest_file.parent.mkdir(parents=True, exist_ok=True)
