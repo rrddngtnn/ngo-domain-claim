@@ -31,3 +31,9 @@ snapshot-pull:
 
 export-bridge:
 	python3 -m ngo_domain_claim.cli export-bridge
+
+taint-audit:
+	python3 -m ngo_domain_claim.cli taint-audit
+
+wayback-mirror:
+	python3 -m ngo_domain_claim.cli wayback-mirror --target $(DOMAIN)

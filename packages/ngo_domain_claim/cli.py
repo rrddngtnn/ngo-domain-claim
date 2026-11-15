@@ -18,7 +18,9 @@ from ngo_domain_claim.core.store import (
     update_wayback,
     upsert_target,
 )
+from ngo_domain_claim.recon.mirror import mirror_clean_wayback_site
 from ngo_domain_claim.recon.snapshot import extract_org_metadata, fetch_latest_snapshot
+from ngo_domain_claim.recon.taint import analyze_snapshot_taint
 from ngo_domain_claim.recon.wayback import fetch_cdx_summary
 from ngo_domain_claim.scanner.pipeline import run_scan
 from ngo_domain_claim.scanner.preflight import check_domain_preflight
@@ -69,6 +71,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p_meta = sub.add_parser("show-meta", help="Show extracted snapshot metadata for a target")
     p_meta.add_argument("--target", required=True)
+
+    sub.add_parser("taint-audit", help="Re-evaluate stored snapshot_meta rows and demote tainted targets")
+
+    p_mir = sub.add_parser("wayback-mirror", help="Pull clean pre-taint archived HTML pages into a local folder")
+    p_mir.add_argument("--target", required=True, help="root_domain or gs_id")
+    p_mir.add_argument("--out-dir", default=None, help="Output directory (default: private/mirror/<domain>)")
+    p_mir.add_argument("--before-ts", default=None, help="Optional max Wayback timestamp e.g. 20241231235959")
+    p_mir.add_argument("--max-pages", type=int, default=8)
 
     p_adv = sub.add_parser("set-stage", help="Update lifecycle stage for a candidate")
     p_adv.add_argument("--target", required=True, help="root_domain or gs_id")
@@ -223,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             targets = [
                 dict(r)
                 for r in db.execute(
-                    "SELECT gs_id, root_domain, name FROM targets WHERE gs_id=? OR root_domain=?",
+                    "SELECT gs_id, iso3, root_domain, name FROM targets WHERE gs_id=? OR root_domain=?",
                     (args.target, args.target.lower()),
                 ).fetchall()
             ]
@@ -231,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
             targets = [
                 dict(r)
                 for r in db.execute(
-                    "SELECT gs_id, root_domain, name FROM targets "
+                    "SELECT gs_id, iso3, root_domain, name FROM targets "
                     "WHERE wayback_snapshots > 0 AND stage IN ('discovered','wayback_checked') "
                     "ORDER BY score DESC, wayback_snapshots DESC LIMIT ?",
                     (args.limit,),
@@ -243,17 +253,68 @@ def main(argv: list[str] | None = None) -> int:
             if snap.get("error"):
                 results.append({"root_domain": t["root_domain"], "error": snap["error"]})
                 continue
-            meta = extract_org_metadata(snap)
+            meta = extract_org_metadata(snap, iso3=t.get("iso3") or "UNK", root_domain=t["root_domain"])
             save_snapshot_meta(db, t["gs_id"], meta)
             results.append({
                 "root_domain": t["root_domain"],
                 "snapshot_ts": meta.get("snapshot_ts"),
+                "taint_verdict": (meta.get("taint") or {}).get("verdict"),
+                "taint_reasons": (meta.get("taint") or {}).get("reasons"),
                 "director_name": meta.get("director_name"),
                 "emails": (meta.get("emails_on_page") or [])[:3],
                 "page_title": meta.get("page_title"),
                 "mission": (meta.get("mission_excerpt") or "")[:120],
             })
         print(json.dumps(results, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "taint-audit":
+        rows = db.execute(
+            """SELECT sm.gs_id, sm.page_title, sm.mission_excerpt, t.iso3, t.root_domain
+               FROM snapshot_meta sm
+               JOIN targets t ON t.gs_id = sm.gs_id"""
+        ).fetchall()
+        flagged = []
+        for r in rows:
+            res = analyze_snapshot_taint(
+                r["page_title"] or "",
+                r["mission_excerpt"] or "",
+                iso3=r["iso3"],
+                root_domain=r["root_domain"],
+                page_title=r["page_title"],
+            )
+            db.execute(
+                "UPDATE snapshot_meta SET taint_verdict=?, taint_reasons=? WHERE gs_id=?",
+                (res["verdict"], json.dumps(res["reasons"]), r["gs_id"]),
+            )
+            if res["is_tainted"]:
+                db.execute(
+                    "UPDATE targets SET stage='tainted_history', score=0, notes=? WHERE gs_id=?",
+                    (f"taint:{res['verdict']} {','.join(res['reasons'])}", r["gs_id"]),
+                )
+                flagged.append({"root_domain": r["root_domain"], "verdict": res["verdict"], "reasons": res["reasons"]})
+        db.commit()
+        print(json.dumps({"audited": len(rows), "flagged": flagged}, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "wayback-mirror":
+        row = db.execute(
+            "SELECT gs_id, iso3, root_domain FROM targets WHERE gs_id=? OR root_domain=?",
+            (args.target, args.target.lower()),
+        ).fetchone()
+        dom = row["root_domain"] if row else args.target.lower()
+        iso = row["iso3"] if row else "UNK"
+        out_dir = args.out_dir or f"private/mirror/{dom}"
+        manifest = mirror_clean_wayback_site(
+            dom,
+            out_dir,
+            iso3=iso,
+            before_ts=args.before_ts,
+            max_pages=args.max_pages,
+            timeout=cfg.probe.timeout_s,
+            user_agent=cfg.user_agent,
+        )
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
         return 0
 
     if args.cmd == "show-meta":

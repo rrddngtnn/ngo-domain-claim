@@ -8,6 +8,8 @@ import json
 import re
 from typing import Any
 import urllib.parse
+
+from ngo_domain_claim.recon.taint import analyze_snapshot_taint
 import urllib.request
 
 ARCHIVE_PREFIX = "https://web.archive.org/web/"
@@ -125,7 +127,7 @@ def fetch_latest_snapshot(domain: str, timeout: int = 20, include_subpages: bool
     }
 
 
-def extract_org_metadata(snapshot: dict[str, Any]) -> dict[str, Any]:
+def extract_org_metadata(snapshot: dict[str, Any], *, iso3: str = 'UNK', root_domain: str = '') -> dict[str, Any]:
     """Extract Proper-Cased director names, emails, title, and mission excerpt."""
     html = snapshot.get("html") or ""
     text = snapshot.get("text") or ""
@@ -155,6 +157,13 @@ def extract_org_metadata(snapshot: dict[str, Any]) -> dict[str, Any]:
     if miss_m:
         mission = " ".join(miss_m.group(1).split())[:400]
 
+    taint = analyze_snapshot_taint(
+        html,
+        text,
+        iso3=iso3,
+        root_domain=root_domain,
+        page_title=title,
+    )
     return {
         "snapshot_ts": snapshot.get("ts"),
         "snapshot_url": snapshot.get("url"),
@@ -164,4 +173,5 @@ def extract_org_metadata(snapshot: dict[str, Any]) -> dict[str, Any]:
         "page_title": title,
         "meta_description": desc,
         "mission_excerpt": mission,
+        "taint": taint,
     }

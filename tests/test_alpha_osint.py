@@ -264,3 +264,62 @@ def test_preflight_and_text_urls_offline(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0]["website"] == "https://sampletrust-bd.org"
     assert rows[0]["registryId"] == "3548"
+
+
+def test_deterministic_taint_and_auto_demotion(tmp_path: Path):
+    from ngo_domain_claim.core.store import save_snapshot_meta, upsert_target
+    from ngo_domain_claim.recon.snapshot import extract_org_metadata
+    from ngo_domain_claim.recon.taint import analyze_snapshot_taint
+
+    # 1. CJK hijack on a Liberian NGO domain (exact skifo.org numeric entity case)
+    cjk_html = "<html><head><title>&#51;&#57;&#56;&#20803;&#19968;&#30871;&#38754;&#65292;&#25105;&#26159;&#19981;&#26159;&#22823;&#20900;&#31181;&#65311;</title></head><body>赌博平台</body></html>"
+    res_cjk = analyze_snapshot_taint(cjk_html, "赌博平台", iso3="LBR", root_domain="skifo.org", page_title="398元一碗面，我是不是大冤种？")
+    assert res_cjk["verdict"] == "tainted_spam"
+    assert res_cjk["is_tainted"] is True
+    assert any("cjk_script_hijack" in r for r in res_cjk["reasons"])
+
+    # 2. Domain parking signature
+    res_park = analyze_snapshot_taint("<html><body>This domain is for sale on sedoparking.com</body></html>", "This domain is for sale", iso3="BDI", root_domain="tca-help.org")
+    assert res_park["verdict"] == "domain_parked"
+
+    # 3. Clean French/English NGO snapshot
+    res_clean = analyze_snapshot_taint("<html><head><title>Accueil - TCA</title></head><body>Tabitha Community in Action Burundi</body></html>", "Tabitha Community in Action Burundi", iso3="BDI", root_domain="tca-help.org")
+    assert res_clean["verdict"] == "clean"
+    assert res_clean["is_tainted"] is False
+
+    # 4. Auto-demotion in SQLite when save_snapshot_meta receives tainted metadata
+    db = open_db(tmp_path / "taint.sqlite")
+    upsert_target(db, {
+        "id": "org_skifo",
+        "iso": "LBR",
+        "country": "Liberia",
+        "name": "Star Kids International Foundation",
+        "reg": "LBR",
+        "regcode": "LBR",
+        "registryId": "053048803",
+        "website": "https://skifo.org",
+        "rdom": "skifo.org",
+        "rdap": "AVAILABLE(404)",
+        "conf": "strong",
+    })
+    meta = extract_org_metadata({"ts": "20250411", "url": "http://x", "html": cjk_html, "text": "赌博平台"}, iso3="LBR", root_domain="skifo.org")
+    save_snapshot_meta(db, "org_skifo", meta)
+    row = db.execute("SELECT stage, score, notes FROM targets WHERE gs_id='org_skifo'").fetchone()
+    assert row["stage"] == "tainted_history"
+    assert row["score"] == 0
+
+
+def test_clean_wayback_html_strips_toolbar_and_rewrites_links():
+    from ngo_domain_claim.recon.mirror import clean_wayback_html
+
+    raw_wb = """<html><head>
+    <script src="https://web-static.archive.org/_static/js/wombat.js"></script>
+    <link rel="stylesheet" href="https://web-static.archive.org/_static/css/banner-styles.css" />
+    </head><body>
+    <!-- BEGIN WAYBACK TOOLBAR INSERT --><div>WAYBACK BANNER</div><!-- END WAYBACK TOOLBAR INSERT -->
+    <a href="https://web.archive.org/web/20240722053503/https://tca-help.org/about-us/">About Us</a>
+    </body></html>"""
+    cleaned = clean_wayback_html(raw_wb, root_domain="tca-help.org")
+    assert "WAYBACK BANNER" not in cleaned
+    assert "wombat.js" not in cleaned
+    assert 'href="/about-us/"' in cleaned

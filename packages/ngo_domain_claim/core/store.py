@@ -11,6 +11,7 @@ from typing import Any
 STAGES = (
     "discovered",
     "wayback_checked",
+    "tainted_history",
     "domain_registered",
     "alibi_deployed",
     "aging",
@@ -73,6 +74,8 @@ CREATE TABLE IF NOT EXISTS snapshot_meta (
   page_title        TEXT,
   meta_description  TEXT,
   mission_excerpt   TEXT,
+  taint_verdict     TEXT DEFAULT 'clean',
+  taint_reasons     TEXT DEFAULT '[]',
   fetched_at        TEXT NOT NULL
 );
 
@@ -148,6 +151,12 @@ def open_db(path: str | Path = "private/alpha_claims.sqlite") -> sqlite3.Connect
         pass
     db.executescript(SCHEMA)
     db.row_factory = sqlite3.Row
+    cols = {r["name"] for r in db.execute("PRAGMA table_info(snapshot_meta)").fetchall()}
+    if "taint_verdict" not in cols:
+        db.execute("ALTER TABLE snapshot_meta ADD COLUMN taint_verdict TEXT DEFAULT 'clean'")
+    if "taint_reasons" not in cols:
+        db.execute("ALTER TABLE snapshot_meta ADD COLUMN taint_reasons TEXT DEFAULT '[]'")
+    db.commit()
     return db
 
 
@@ -368,13 +377,17 @@ def status_summary(db: sqlite3.Connection) -> dict[str, Any]:
 
 
 def save_snapshot_meta(db: sqlite3.Connection, gs_id: str, meta: dict[str, Any]) -> None:
-    """Persist extracted Wayback snapshot metadata for a target."""
+    """Persist extracted Wayback snapshot metadata and auto-demote tainted targets."""
     now = utcnow()
+    taint = meta.get("taint") or {}
+    verdict = taint.get("verdict") or "clean"
+    reasons = taint.get("reasons") or []
     db.execute(
         """INSERT INTO snapshot_meta(
              gs_id, snapshot_ts, snapshot_url, director_name, other_names,
-             emails_on_page, page_title, meta_description, mission_excerpt, fetched_at
-           ) VALUES (?,?,?,?,?,?,?,?,?,?)
+             emails_on_page, page_title, meta_description, mission_excerpt,
+             taint_verdict, taint_reasons, fetched_at
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(gs_id) DO UPDATE SET
              snapshot_ts=excluded.snapshot_ts,
              snapshot_url=excluded.snapshot_url,
@@ -384,6 +397,8 @@ def save_snapshot_meta(db: sqlite3.Connection, gs_id: str, meta: dict[str, Any])
              page_title=excluded.page_title,
              meta_description=excluded.meta_description,
              mission_excerpt=excluded.mission_excerpt,
+             taint_verdict=excluded.taint_verdict,
+             taint_reasons=excluded.taint_reasons,
              fetched_at=excluded.fetched_at""",
         (
             gs_id,
@@ -395,10 +410,19 @@ def save_snapshot_meta(db: sqlite3.Connection, gs_id: str, meta: dict[str, Any])
             meta.get("page_title"),
             meta.get("meta_description"),
             meta.get("mission_excerpt"),
+            verdict,
+            json.dumps(reasons, ensure_ascii=False),
             now,
         ),
     )
-    record_event(db, gs_id, "snapshot_fetched", f"ts={meta.get('snapshot_ts')} director={meta.get('director_name')}")
+    if verdict != "clean":
+        db.execute(
+            "UPDATE targets SET stage='tainted_history', score=0, notes=?, updated_at=? WHERE gs_id=?",
+            (f"taint:{verdict} {','.join(reasons)}", now, gs_id),
+        )
+        record_event(db, gs_id, "taint_flagged", f"verdict={verdict} reasons={reasons}", None, "tainted_history")
+    else:
+        record_event(db, gs_id, "snapshot_fetched", f"ts={meta.get('snapshot_ts')} director={meta.get('director_name')}")
     db.commit()
 
 
