@@ -323,3 +323,95 @@ def test_clean_wayback_html_strips_toolbar_and_rewrites_links():
     assert "WAYBACK BANNER" not in cleaned
     assert "wombat.js" not in cleaned
     assert 'href="/about-us/"' in cleaned
+
+
+def test_four_signal_watch_detects_resurrection_and_claimed_org(tmp_path: Path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from ngo_domain_claim.core.store import upsert_target
+    from ngo_domain_claim.scanner.ct_watch import watch_target
+
+    class _WatchMock(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+        def do_GET(self):
+            if self.path == "/iana/dns.json":
+                port = self.server.server_port
+                body = json.dumps({"services": [[["org"], [f"http://127.0.0.1:{port}/rdap/"]]]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/rdap/domain/claimed-org.org":
+                self.send_response(404)
+                self.end_headers()
+                return
+            if self.path.startswith("/resolve"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"Status": 3}')
+                return
+            if self.path == "/v1/organisations/org_claimed_99":
+                body = json.dumps({
+                    "data": {
+                        "id": "org_claimed_99",
+                        "claimedAt": "2026-11-10T12:00:00Z",
+                        "registrationActive": True,
+                    }
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    srv = HTTPServer(("127.0.0.1", 0), _WatchMock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_port}"
+        cfg_file = tmp_path / "alpha.toml"
+        cfg_file.write_text(
+            f"""[core]
+db_path = "{tmp_path / 'watch.sqlite'}"
+
+[source]
+kind = "rest_directory"
+base_url = "{base}/v1/organisations"
+
+[probe]
+doh_url = "{base}/resolve"
+enable_doh = true
+iana_bootstrap_url = "{base}/iana/dns.json"
+rdap_cache_path = "{tmp_path / 'iana.json'}"
+""",
+            encoding="utf-8",
+        )
+        cfg = load_config(cfg_file)
+        db = open_db(cfg.db_path)
+        upsert_target(db, {
+            "id": "org_claimed_99",
+            "iso": "BDI",
+            "country": "Burundi",
+            "name": "Already Claimed Charity",
+            "reg": "MOIPS",
+            "regcode": "MOIPS",
+            "registryId": "530/99",
+            "website": "https://claimed-org.org",
+            "rdom": "claimed-org.org",
+            "rdap": "AVAILABLE(404)",
+            "conf": "strong",
+        })
+        target_row = dict(db.execute("SELECT * FROM targets WHERE gs_id='org_claimed_99'").fetchone())
+        rep = watch_target(db, cfg, target_row, check_ct=False, check_directory=True, use_system_dns=False)
+        assert rep["verdict"] == "burned_or_resurrected"
+        assert any("directory_already_claimed" in r for r in rep["reasons"])
+        updated = db.execute("SELECT stage, score FROM targets WHERE gs_id='org_claimed_99'").fetchone()
+        assert updated["stage"] == "rejected"
+        assert updated["score"] == 0
+    finally:
+        srv.shutdown()

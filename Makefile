@@ -37,3 +37,6 @@ taint-audit:
 
 wayback-mirror:
 	python3 -m ngo_domain_claim.cli wayback-mirror --target $(DOMAIN)
+
+watch:
+	python3 -m ngo_domain_claim.cli watch --limit $${N:-5}

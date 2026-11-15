@@ -23,6 +23,7 @@ from ngo_domain_claim.recon.snapshot import extract_org_metadata, fetch_latest_s
 from ngo_domain_claim.recon.taint import analyze_snapshot_taint
 from ngo_domain_claim.recon.wayback import fetch_cdx_summary
 from ngo_domain_claim.scanner.pipeline import run_scan
+from ngo_domain_claim.scanner.ct_watch import watch_target
 from ngo_domain_claim.scanner.preflight import check_domain_preflight
 from ngo_domain_claim.scanner.rdap import RdapResolver
 
@@ -52,6 +53,12 @@ def main(argv: list[str] | None = None) -> int:
     p_pre.add_argument("--domain", required=True)
     p_pre.add_argument("--email", default=None)
     p_pre.add_argument("--name", default=None)
+
+    p_wt = sub.add_parser("watch", help="Run 4-signal OSINT guard (DNS + RDAP + crt.sh CT + Directory claimedAt)")
+    p_wt.add_argument("--target", default=None, help="Specific root_domain or gs_id")
+    p_wt.add_argument("--limit", type=int, default=5)
+    p_wt.add_argument("--no-ct", action="store_true", help="Skip crt.sh query")
+    p_wt.add_argument("--no-directory", action="store_true", help="Skip directory single-org lookup")
 
     p_imp = sub.add_parser("import-scan", help="Import normalized JSON scan output into SQLite")
     p_imp.add_argument("--file", required=True, help="Path to JSON array file")
@@ -130,6 +137,45 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "scan":
         report = run_scan(cfg, db, dry_run=args.dry_run)
         print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "watch":
+        if args.target:
+            targets = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM targets WHERE gs_id=? OR root_domain=?",
+                    (args.target, args.target.lower()),
+                ).fetchall()
+            ]
+        else:
+            targets = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM targets WHERE stage IN ('discovered','wayback_checked') ORDER BY score DESC LIMIT ?",
+                    (args.limit,),
+                ).fetchall()
+            ]
+        resolver = RdapResolver(
+            bootstrap_url=cfg.probe.iana_bootstrap_url,
+            cache_path=cfg.probe.rdap_cache_path,
+            cache_ttl_s=cfg.probe.rdap_cache_ttl_s,
+            extra_servers=cfg.probe.extra_rdap_servers,
+            timeout_s=cfg.probe.timeout_s,
+            user_agent=cfg.user_agent,
+        )
+        reports = [
+            watch_target(
+                db,
+                cfg,
+                t,
+                resolver=resolver,
+                check_ct=not args.no_ct,
+                check_directory=not args.no_directory,
+            )
+            for t in targets
+        ]
+        print(json.dumps(reports, indent=2, ensure_ascii=False))
         return 0
 
     if args.cmd == "preflight":
