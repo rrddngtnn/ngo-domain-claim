@@ -59,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     p_wt.add_argument("--limit", type=int, default=5)
     p_wt.add_argument("--no-ct", action="store_true", help="Skip crt.sh query")
     p_wt.add_argument("--no-directory", action="store_true", help="Skip directory single-org lookup")
+    p_wt.add_argument("--rebrand-web", action="store_true", help="Query web search snippets for rebrand / formerly-known-as signals")
 
     p_imp = sub.add_parser("import-scan", help="Import normalized JSON scan output into SQLite")
     p_imp.add_argument("--file", required=True, help="Path to JSON array file")
@@ -172,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
                 resolver=resolver,
                 check_ct=not args.no_ct,
                 check_directory=not args.no_directory,
+                check_rebrand=args.rebrand_web,
             )
             for t in targets
         ]

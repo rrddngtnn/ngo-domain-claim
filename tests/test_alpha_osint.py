@@ -415,3 +415,117 @@ rdap_cache_path = "{tmp_path / 'iana.json'}"
         assert updated["score"] == 0
     finally:
         srv.shutdown()
+
+
+def test_signal5_rebrand_and_claimed_twin_detection(tmp_path: Path):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from ngo_domain_claim.core.store import upsert_target
+    from ngo_domain_claim.scanner.ct_watch import watch_target
+
+    class _RebrandMock(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+        def do_GET(self):
+            if self.path == "/iana/dns.json":
+                port = self.server.server_port
+                body = json.dumps({"services": [[["org"], [f"http://127.0.0.1:{port}/rdap/"]]]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/rdap/domain/old-ngo.org":
+                self.send_response(404)
+                self.end_headers()
+                return
+            if self.path.startswith("/resolve"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"Status": 3}')
+                return
+            if self.path == "/v1/organisations/org_old_1":
+                body = json.dumps({"data": {"id": "org_old_1", "claimedAt": None, "registrationActive": True}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.startswith("/v1/organisations?"):
+                body = json.dumps({
+                    "data": [
+                        {"id": "org_old_1", "name": "Old Hope Action", "website": "http://old-ngo.org", "claimedAt": None},
+                        {"id": "org_new_2", "name": "New Rise Action", "website": "http://new-rise.org", "claimedAt": "2026-05-14T10:00:00Z", "address": "Av 53 Bujumbura"},
+                    ]
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.startswith("/search?"):
+                html = b"<html><body>Community New Rise (Formerly Old Hope Action) - We've changed our name!</body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(html)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    srv = HTTPServer(("127.0.0.1", 0), _RebrandMock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_port}"
+        cfg_file = tmp_path / "alpha.toml"
+        cfg_file.write_text(
+            f"""[core]
+db_path = "{tmp_path / 'reb.sqlite'}"
+
+[source]
+kind = "rest_directory"
+base_url = "{base}/v1/organisations"
+
+[probe]
+doh_url = "{base}/resolve"
+enable_doh = true
+iana_bootstrap_url = "{base}/iana/dns.json"
+rdap_cache_path = "{tmp_path / 'iana.json'}"
+""",
+            encoding="utf-8",
+        )
+        cfg = load_config(cfg_file)
+        db = open_db(cfg.db_path)
+        upsert_target(db, {
+            "id": "org_old_1",
+            "iso": "BDI",
+            "country": "Burundi",
+            "name": "Old Hope Action",
+            "reg": "MOIPS",
+            "regcode": "MOIPS",
+            "registryId": "530/11",
+            "website": "https://old-ngo.org",
+            "rdom": "old-ngo.org",
+            "rdap": "AVAILABLE(404)",
+            "conf": "strong",
+            "address": "Av 53 Bujumbura",
+        })
+        row = dict(db.execute("SELECT * FROM targets WHERE gs_id='org_old_1'").fetchone())
+        rep = watch_target(
+            db,
+            cfg,
+            row,
+            check_ct=False,
+            check_directory=True,
+            check_rebrand=True,
+            rebrand_search_template=f"{base}/search?q={{query}}",
+            use_system_dns=False,
+        )
+        assert rep["verdict"] == "burned_or_resurrected"
+        assert len(rep["claimed_twins"]) == 1
+        assert any("directory_claimed_twin" in r for r in rep["reasons"])
+        assert any("rebrand" in r or "formerly" in r for r in rep["reasons"])
+    finally:
+        srv.shutdown()

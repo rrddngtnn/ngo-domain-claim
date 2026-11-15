@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sqlite3
 from typing import Any
 import urllib.parse
@@ -127,6 +128,130 @@ def fetch_directory_org_state(
         return None
 
 
+
+REBRAND_PHRASES = (
+    "we've changed our name",
+    "we have changed our name",
+    "changed our name to",
+    "formerly known as",
+    "now known as",
+    "we have rebranded",
+    "rebranded as",
+    "moved to a new website",
+    "nous avons changé de nom",
+    "anciennement",
+)
+
+
+def _norm_addr(val: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", (val or "").lower())
+
+
+def check_directory_twins(
+    row: dict[str, Any],
+    cfg: AlphaConfig,
+) -> dict[str, Any]:
+    """Query directory search in the same country to detect claimed rebranded/twin records."""
+    if not cfg.source.base_url:
+        return {"checked": False, "claimed_twins": []}
+    iso = (row.get("iso3") or "").upper()
+    name = (row.get("name") or "").strip()
+    gs_id = row.get("gs_id") or ""
+    tokens = [w for w in re.split(r"[^A-Za-z0-9]+", name) if len(w) >= 4]
+    query = " ".join(tokens[:3]) or name
+    if not iso or not query:
+        return {"checked": False, "claimed_twins": []}
+
+    base = cfg.source.base_url.rstrip("/")
+    url = f"{base}?{urllib.parse.urlencode({'countryCode': iso, 'query': query})}"
+    hdrs = {"User-Agent": cfg.user_agent, "Accept": "application/json"}
+    token = os.environ.get(cfg.source.token_env, "").strip()
+    if token:
+        val = f"{cfg.source.auth_prefix}{token}" if cfg.source.auth_prefix else token
+        hdrs[cfg.source.auth_header] = val
+    if cfg.source.origin:
+        hdrs["Origin"] = cfg.source.origin
+    if cfg.source.referer:
+        hdrs["Referer"] = cfg.source.referer
+
+    proxy_url = os.environ.get(cfg.source.proxy_env, "").strip()
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        if proxy_url:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+            ctx = opener.open(req, timeout=cfg.probe.timeout_s)
+        else:
+            ctx = urllib.request.urlopen(req, timeout=cfg.probe.timeout_s)
+        with ctx as resp:
+            rows = json.loads(resp.read().decode("utf-8", "ignore")).get("data") or []
+    except Exception:
+        return {"checked": False, "claimed_twins": []}
+
+    row_addr = _norm_addr(row.get("address"))
+    claimed_twins: list[dict[str, Any]] = []
+    for cand in rows:
+        if cand.get("id") == gs_id:
+            continue
+        if not cand.get("claimedAt"):
+            continue
+        cand_addr = _norm_addr(cand.get("address"))
+        addr_match = bool(row_addr and cand_addr and (row_addr[:12] in cand_addr or cand_addr[:12] in row_addr))
+        claimed_twins.append({
+            "id": cand.get("id"),
+            "name": cand.get("name"),
+            "website": cand.get("website"),
+            "claimedAt": cand.get("claimedAt"),
+            "address_match": addr_match,
+        })
+    return {"checked": True, "claimed_twins": claimed_twins}
+
+
+def check_rebrand_signals(
+    db: sqlite3.Connection,
+    row: dict[str, Any],
+    *,
+    search_url_template: str = "https://html.duckduckgo.com/html/?q={query}",
+    check_web: bool = False,
+    timeout_s: int = 10,
+    user_agent: str = "ngo-domain-claim/0.2",
+) -> dict[str, Any]:
+    """Detect rebrand phrases in stored snapshot_meta or optional web search results."""
+    gs_id = row.get("gs_id") or ""
+    name = (row.get("name") or "").strip()
+    dom = (row.get("root_domain") or "").lower().strip(".")
+    reasons: list[str] = []
+
+    snap = db.execute(
+        "SELECT page_title, meta_description, mission_excerpt FROM snapshot_meta WHERE gs_id=?",
+        (gs_id,),
+    ).fetchone()
+    if snap:
+        blob = " ".join(str(snap[k] or "") for k in ("page_title", "meta_description", "mission_excerpt")).lower()
+        for ph in REBRAND_PHRASES:
+            if ph in blob:
+                reasons.append(f"snapshot_rebrand_phrase:{ph}")
+
+    web_hits: list[str] = []
+    if check_web and name:
+        q = urllib.parse.quote(f'"{name}" ("changed our name" OR "formerly" OR "now known as")')
+        url = search_url_template.format(query=q)
+        req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                html = resp.read().decode("utf-8", "ignore").lower()
+            for ph in REBRAND_PHRASES:
+                if ph in html:
+                    reasons.append(f"web_rebrand_phrase:{ph}")
+            # Detect formerly <org> pattern in search snippets
+            if f"formerly {name.lower()}" in html or f"formerly known as {name.lower()}" in html:
+                reasons.append(f"web_formerly_named:{name}")
+                web_hits.append(url)
+        except Exception:
+            pass
+
+    return {"rebrand_detected": bool(reasons), "reasons": reasons, "web_hits": web_hits}
+
+
 def watch_target(
     db: sqlite3.Connection,
     cfg: AlphaConfig,
@@ -135,6 +260,8 @@ def watch_target(
     resolver: RdapResolver | None = None,
     check_ct: bool = True,
     check_directory: bool = True,
+    check_rebrand: bool = False,
+    rebrand_search_template: str = "https://html.duckduckgo.com/html/?q={query}",
     recent_cert_days: int = 120,
     use_system_dns: bool = True,
 ) -> dict[str, Any]:
@@ -191,6 +318,21 @@ def watch_target(
         if dir_state.get("registrationActive") is False:
             reasons.append("regulator_registration_inactive")
 
+    # Signal 5: Directory claimed twins + Rebrand footprint check
+    twin_res = check_directory_twins(row, cfg) if check_directory else {"checked": False, "claimed_twins": []}
+    for tw in twin_res.get("claimed_twins") or []:
+        reasons.append(f"directory_claimed_twin:{tw['name']}({tw.get('website')})")
+
+    reb_res = check_rebrand_signals(
+        db,
+        row,
+        search_url_template=rebrand_search_template,
+        check_web=check_web_rebrand if False else check_rebrand,
+        timeout_s=cfg.probe.timeout_s,
+        user_agent=cfg.user_agent,
+    )
+    reasons.extend(reb_res["reasons"])
+
     verdict = "burned_or_resurrected" if reasons else "clean_available"
     now = utcnow()
     if reasons:
@@ -214,4 +356,6 @@ def watch_target(
         "ct_farm_ca": ct_res.get("farm_ca_detected", False),
         "directory_claimed_at": dir_state.get("claimedAt") if dir_state else None,
         "registration_active": dir_state.get("registrationActive") if dir_state else None,
+        "claimed_twins": twin_res.get("claimed_twins", []),
+        "rebrand_reasons": reb_res["reasons"],
     }
