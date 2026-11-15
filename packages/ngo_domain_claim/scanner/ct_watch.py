@@ -233,19 +233,24 @@ def check_rebrand_signals(
 
     web_hits: list[str] = []
     if check_web and name:
-        q = urllib.parse.quote(f'"{name}" ("changed our name" OR "formerly" OR "now known as")')
+        q = urllib.parse.quote(f'"{name}" (formerly OR rebranded OR "changed our name")')
         url = search_url_template.format(query=q)
         req = urllib.request.Request(url, headers={"User-Agent": user_agent})
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                html = resp.read().decode("utf-8", "ignore").lower()
-            for ph in REBRAND_PHRASES:
-                if ph in html:
-                    reasons.append(f"web_rebrand_phrase:{ph}")
-            # Detect formerly <org> pattern in search snippets
-            if f"formerly {name.lower()}" in html or f"formerly known as {name.lower()}" in html:
+                raw_html = resp.read().decode("utf-8", "ignore")
+            # Remove <form>, <input>, <script>, <style>, <title> so echoed query strings never false-match
+            cleaned_html = re.sub(r"<(?:form|script|style|title)[^>]*>.*?</(?:form|script|style|title)>", " ", raw_html, flags=re.I | re.S)
+            cleaned_html = re.sub(r"<input[^>]*>", " ", cleaned_html, flags=re.I)
+            plain = re.sub(r"<[^>]+>", " ", cleaned_html)
+            plain = re.sub(r"\s+", " ", plain).lower()
+            low_name = name.lower()
+            if f"formerly {low_name}" in plain or f"formerly known as {low_name}" in plain:
                 reasons.append(f"web_formerly_named:{name}")
                 web_hits.append(url)
+            for ph in REBRAND_PHRASES:
+                if ph in plain:
+                    reasons.append(f"web_rebrand_phrase:{ph}")
         except Exception:
             pass
 

@@ -529,3 +529,55 @@ rdap_cache_path = "{tmp_path / 'iana.json'}"
         assert any("rebrand" in r or "formerly" in r for r in rep["reasons"])
     finally:
         srv.shutdown()
+
+
+def test_rebrand_web_ignores_echoed_search_input_tags(tmp_path: Path):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from ngo_domain_claim.core.store import upsert_target
+    from ngo_domain_claim.scanner.ct_watch import check_rebrand_signals
+
+    class _EchoMock(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+        def do_GET(self):
+            body = (
+                '<html><head><title>"Clean Aid" (formerly OR "changed our name")</title></head>'
+                '<body><form><input name="q" value="\"Clean Aid\" (formerly OR \"changed our name\")"></form>'
+                '<div class="result__snippet">Clean Aid is an active community nonprofit in Benin.</div>'
+                "</body></html>"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = HTTPServer(("127.0.0.1", 0), _EchoMock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        db = open_db(tmp_path / "echo.sqlite")
+        upsert_target(db, {
+            "id": "org_echo_1",
+            "iso": "BEN",
+            "country": "Benin",
+            "name": "Clean Aid",
+            "reg": "MDLG",
+            "regcode": "MDLG",
+            "registryId": "123",
+            "website": "https://cleanaid-benin.org",
+            "rdom": "cleanaid-benin.org",
+            "rdap": "AVAILABLE(404)",
+            "conf": "strong",
+        })
+        row = dict(db.execute("SELECT * FROM targets WHERE gs_id='org_echo_1'").fetchone())
+        rep = check_rebrand_signals(
+            db,
+            row,
+            search_url_template=f"http://127.0.0.1:{srv.server_port}/?q={{query}}",
+            check_web=True,
+        )
+        assert rep["rebrand_detected"] is False
+        assert rep["reasons"] == []
+    finally:
+        srv.shutdown()
