@@ -39,6 +39,7 @@ class SourceConfig:
     auth_header: str = "Authorization"
     auth_prefix: str = ""
     token_env: str = "DIRECTORY_API_TOKEN"
+    proxy_env: str = "ALPHA_PROXY_URL"
     origin: str = ""
     referer: str = ""
     country_param: str = "countryCode"
@@ -130,6 +131,7 @@ def load_config(
         auth_header=src_sec.get("auth_header", "Authorization"),
         auth_prefix=src_sec.get("auth_prefix", ""),
         token_env=src_sec.get("token_env", "DIRECTORY_API_TOKEN"),
+        proxy_env=src_sec.get("proxy_env", "ALPHA_PROXY_URL"),
         origin=os.environ.get("DIRECTORY_ORIGIN") or src_sec.get("origin", ""),
         referer=os.environ.get("DIRECTORY_REFERER") or src_sec.get("referer", ""),
         country_param=src_sec.get("country_param", "countryCode"),

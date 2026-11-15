@@ -6,6 +6,7 @@ from importlib import metadata
 import json
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any, Iterator, Protocol
 import urllib.error
@@ -93,7 +94,13 @@ class RestDirectorySource:
         for attempt in range(4):
             req = urllib.request.Request(url, headers=self._headers())
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
+                proxy_url = os.environ.get(self.cfg.proxy_env, "").strip()
+                if proxy_url:
+                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+                    ctx_mgr = opener.open(req, timeout=15)
+                else:
+                    ctx_mgr = urllib.request.urlopen(req, timeout=15)
+                with ctx_mgr as resp:
                     payload = json.loads(resp.read().decode("utf-8", "ignore"))
                 if isinstance(payload, list):
                     return payload
@@ -152,6 +159,52 @@ class CsvFileSource:
                 yield normalize_record(dict(row), self.cfg.field_map)
 
 
+class TextUrlsSource:
+    """Extract website URLs and nearby registration context from plain-text registry dumps."""
+
+    URL_RE = re.compile(r"(?:https?://|www\.)([A-Za-z0-9.-]+\.[A-Za-z]{2,15})", re.I)
+
+    def __init__(self, cfg: SourceConfig) -> None:
+        self.cfg = cfg
+
+    def iter_contacts(self) -> Iterator[dict[str, Any]]:
+        return self.iter_records()
+
+    def iter_records(self) -> Iterator[dict[str, Any]]:
+        if not self.cfg.file_path:
+            raise ValueError("source.file_path is required for text_urls source")
+        lines = Path(self.cfg.file_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+        seen: set[str] = set()
+        iso = (self.cfg.countries[0] if self.cfg.countries else "UNK").upper()
+        for idx, raw_line in enumerate(lines):
+            cleaned = re.sub(r"^\d+\|", "", raw_line)
+            for m in self.URL_RE.finditer(cleaned):
+                dom = m.group(1).lower().strip(".")
+                if dom.startswith("www."):
+                    dom = dom[4:]
+                if "@" in cleaned and f"@{dom}" in cleaned.lower():
+                    continue
+                if dom in seen:
+                    continue
+                seen.add(dom)
+                win = " ".join(re.sub(r"^\d+\|", "", l) for l in lines[max(0, idx - 2):min(len(lines), idx + 3)])
+                reg_m = re.findall(r"(?:\||\s)(\d{4,7})(?:\||\s)+\d{2}-[A-Za-z]{3}-\d{2}", win)
+                reg_id = reg_m[0] if reg_m else f"LINE-{idx + 1}"
+                yield {
+                    "id": f"texturl_{iso}_{reg_id}_{dom}",
+                    "iso": iso,
+                    "country": iso,
+                    "name": re.sub(r"\s+", " ", win)[:80],
+                    "type": "nonprofit",
+                    "reg": "Registry Text Extract",
+                    "regcode": "TEXT",
+                    "has_registry": True,
+                    "registryId": reg_id,
+                    "website": f"https://{dom}",
+                    "claimedAt": None,
+                }
+
+
 def build_source(cfg: SourceConfig, user_agent: str = "ngo-domain-claim/0.2") -> DirectorySource:
     eps = {ep.name: ep for ep in metadata.entry_points(group="ngo_domain_claim.sources")}
     if cfg.kind in eps:
@@ -163,4 +216,6 @@ def build_source(cfg: SourceConfig, user_agent: str = "ngo-domain-claim/0.2") ->
         return JsonFileSource(cfg)
     if cfg.kind == "csv_file":
         return CsvFileSource(cfg)
+    if cfg.kind == "text_urls":
+        return TextUrlsSource(cfg)
     raise ValueError(f"Unsupported source kind: {cfg.kind}")

@@ -186,3 +186,81 @@ rdap_cache_path = "{tmp_path / 'iana.json'}"
         assert row["director_name"] is None
     finally:
         srv.shutdown()
+
+
+def test_snapshot_name_extraction_rejects_lowercase_phrases():
+    from ngo_domain_claim.recon.snapshot import extract_org_metadata
+
+    html = """
+    <html><head><title>About TCA</title></head><body>
+    <p>As Executive Director: situation in which its people thrive.</p>
+    <p>Executive Director: Jean-Paul Ndayishimiye</p>
+    <p>Email: tcaburundi@tca-help.org</p>
+    </body></html>
+    """
+    meta = extract_org_metadata({"ts": "20240722", "url": "https://web.archive.org/x", "html": html, "text": (
+        "As Executive Director: situation in which its people thrive. "
+        "Executive Director: Jean-Paul Ndayishimiye Email: tcaburundi@tca-help.org"
+    )})
+    assert meta["director_name"] == "Jean-Paul Ndayishimiye"
+    assert "tcaburundi@tca-help.org" in meta["emails_on_page"]
+
+
+def test_preflight_and_text_urls_offline(tmp_path: Path):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from ngo_domain_claim.scanner.preflight import check_domain_preflight
+    from ngo_domain_claim.scanner.sources import TextUrlsSource
+    from ngo_domain_claim.core.config import SourceConfig
+
+    class _PreHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+        def do_GET(self):
+            if self.path.startswith("/resolve"):
+                if "type=A" in self.path:
+                    ans = [{"data": "192.0.2.10"}]
+                elif "type=MX" in self.path:
+                    ans = [{"data": "10 mx.example.test."}]
+                elif "name=_dmarc." in self.path:
+                    ans = [{"data": "v=DMARC1; p=none;"}]
+                else:
+                    ans = [{"data": "v=spf1 include:_spf.example.test ~all"}]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"Status": 0, "Answer": ans}).encode())
+                return
+            if self.path in ("/", "/about-us"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<html><body>Jean-Paul Ndayishimiye director@demo.test</body></html>")
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    srv = HTTPServer(("127.0.0.1", 0), _PreHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        doh = f"http://127.0.0.1:{srv.server_port}/resolve"
+        rep = check_domain_preflight(
+            "127.0.0.1",
+            doh_url=doh,
+            base_scheme="http",
+            port=srv.server_port,
+            expected_email="director@demo.test",
+            expected_name="Jean-Paul Ndayishimiye",
+        )
+        assert rep["ready"] is True
+        assert rep["about_path"] == "/about-us"
+    finally:
+        srv.shutdown()
+
+    dump = tmp_path / "reg.txt"
+    dump.write_text("1|Sample Trust|Road 1|3548|28-Dec-25|www.sampletrust-bd.org\n", encoding="utf-8")
+    rows = list(TextUrlsSource(SourceConfig(kind="text_urls", file_path=str(dump), countries=["BGD"])).iter_records())
+    assert len(rows) == 1
+    assert rows[0]["website"] == "https://sampletrust-bd.org"
+    assert rows[0]["registryId"] == "3548"

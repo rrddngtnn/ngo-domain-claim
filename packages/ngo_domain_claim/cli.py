@@ -21,6 +21,7 @@ from ngo_domain_claim.core.store import (
 from ngo_domain_claim.recon.snapshot import extract_org_metadata, fetch_latest_snapshot
 from ngo_domain_claim.recon.wayback import fetch_cdx_summary
 from ngo_domain_claim.scanner.pipeline import run_scan
+from ngo_domain_claim.scanner.preflight import check_domain_preflight
 from ngo_domain_claim.scanner.rdap import RdapResolver
 
 
@@ -34,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="Show summary counts by stage and country")
 
     p_scan = sub.add_parser("scan", help="Run automated OSINT scan via configured source + DNS + IANA RDAP")
-    p_scan.add_argument("--source-kind", default=None, choices=["rest_directory", "json_file", "csv_file"])
+    p_scan.add_argument("--source-kind", default=None, choices=["rest_directory", "json_file", "csv_file", "text_urls"])
     p_scan.add_argument("--base-url", default=None)
     p_scan.add_argument("--file", default=None)
     p_scan.add_argument("--countries", default=None, help="Comma-separated ISO3 codes")
@@ -44,6 +45,11 @@ def main(argv: list[str] | None = None) -> int:
 
     p_rdap = sub.add_parser("rdap-check", help="Check one domain via authoritative IANA RDAP bootstrap")
     p_rdap.add_argument("--domain", required=True)
+
+    p_pre = sub.add_parser("preflight", help="Verify live DNS (A/MX/SPF/DMARC) and HTTPS/About readiness")
+    p_pre.add_argument("--domain", required=True)
+    p_pre.add_argument("--email", default=None)
+    p_pre.add_argument("--name", default=None)
 
     p_imp = sub.add_parser("import-scan", help="Import normalized JSON scan output into SQLite")
     p_imp.add_argument("--file", required=True, help="Path to JSON array file")
@@ -114,6 +120,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "scan":
         report = run_scan(cfg, db, dry_run=args.dry_run)
         print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "preflight":
+        rep = check_domain_preflight(
+            args.domain,
+            doh_url=cfg.probe.doh_url,
+            expected_email=args.email,
+            expected_name=args.name,
+            timeout_s=cfg.probe.timeout_s,
+            user_agent=cfg.user_agent,
+        )
+        print(json.dumps(rep, indent=2))
         return 0
 
     if args.cmd == "rdap-check":
