@@ -16,3 +16,6 @@ status:
 
 rank:
 	python3 -m ngo_domain_claim.cli rank --limit $${N:-20}
+
+snapshot-pull:
+	python3 -m ngo_domain_claim.cli snapshot-pull --limit $${N:-5}

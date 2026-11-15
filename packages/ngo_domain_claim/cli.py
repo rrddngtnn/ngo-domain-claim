@@ -11,11 +11,14 @@ from ngo_domain_claim.bridge.handoff import export_bridge_snapshot
 from ngo_domain_claim.core.store import (
     STAGES,
     advance_stage,
+    get_snapshot_meta,
     open_db,
+    save_snapshot_meta,
     status_summary,
     update_wayback,
     upsert_target,
 )
+from ngo_domain_claim.recon.snapshot import extract_org_metadata, fetch_latest_snapshot
 from ngo_domain_claim.recon.wayback import fetch_cdx_summary
 
 
@@ -50,6 +53,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_exp = sub.add_parser("export-bridge", help="Export shared bridge JSON for Track Beta correlation")
     p_exp.add_argument("--out", default="private/alpha_bridge.json")
+
+    p_snap = sub.add_parser("snapshot-pull", help="Pull latest archived HTML and extract director/mission metadata")
+    p_snap.add_argument("--limit", type=int, default=5)
+    p_snap.add_argument("--target", default=None, help="root_domain or gs_id")
+
+    p_meta = sub.add_parser("show-meta", help="Show extracted snapshot metadata for a target")
+    p_meta.add_argument("--target", required=True)
 
     args = ap.parse_args(argv)
     db = open_db(args.db)
@@ -144,6 +154,49 @@ def main(argv: list[str] | None = None) -> int:
             "score": updated["score"],
             "notes": updated["notes"],
         }, indent=2))
+        return 0
+
+    if args.cmd == "snapshot-pull":
+        if args.target:
+            targets = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT gs_id, root_domain, name FROM targets WHERE gs_id=? OR root_domain=?",
+                    (args.target, args.target.lower()),
+                ).fetchall()
+            ]
+        else:
+            targets = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT gs_id, root_domain, name FROM targets "
+                    "WHERE wayback_snapshots > 0 AND stage IN ('discovered','wayback_checked') "
+                    "ORDER BY score DESC, wayback_snapshots DESC LIMIT ?",
+                    (args.limit,),
+                ).fetchall()
+            ]
+        results = []
+        for t in targets:
+            snap = fetch_latest_snapshot(t["root_domain"])
+            if snap.get("error"):
+                results.append({"root_domain": t["root_domain"], "error": snap["error"]})
+                continue
+            meta = extract_org_metadata(snap)
+            save_snapshot_meta(db, t["gs_id"], meta)
+            results.append({
+                "root_domain": t["root_domain"],
+                "snapshot_ts": meta.get("snapshot_ts"),
+                "director_name": meta.get("director_name"),
+                "emails": (meta.get("emails_on_page") or [])[:3],
+                "page_title": meta.get("page_title"),
+                "mission": (meta.get("mission_excerpt") or "")[:120],
+            })
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "show-meta":
+        meta = get_snapshot_meta(db, args.target)
+        print(json.dumps(meta, indent=2, ensure_ascii=False) if meta else json.dumps({"error": "not found"}))
         return 0
 
     if args.cmd == "export-bridge":

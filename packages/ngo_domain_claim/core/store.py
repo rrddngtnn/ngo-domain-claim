@@ -63,6 +63,21 @@ CREATE TABLE IF NOT EXISTS targets (
   updated_at        TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS snapshot_meta (
+  gs_id             TEXT PRIMARY KEY,
+  snapshot_ts       TEXT,
+  snapshot_url      TEXT,
+  director_name     TEXT,
+  other_names       TEXT,
+  emails_on_page    TEXT,
+  page_title        TEXT,
+  meta_description  TEXT,
+  mission_excerpt   TEXT,
+  fetched_at        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_snap_dom ON snapshot_meta(director_name);
+
 CREATE TABLE IF NOT EXISTS events (
   id        INTEGER PRIMARY KEY,
   ts        TEXT NOT NULL,
@@ -353,3 +368,48 @@ def status_summary(db: sqlite3.Connection) -> dict[str, Any]:
         "by_country": by_iso,
         "top_candidates": top,
     }
+
+
+def save_snapshot_meta(db: sqlite3.Connection, gs_id: str, meta: dict[str, Any]) -> None:
+    """Persist extracted Wayback snapshot metadata for a target."""
+    now = utcnow()
+    db.execute(
+        """INSERT INTO snapshot_meta(
+             gs_id, snapshot_ts, snapshot_url, director_name, other_names,
+             emails_on_page, page_title, meta_description, mission_excerpt, fetched_at
+           ) VALUES (?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(gs_id) DO UPDATE SET
+             snapshot_ts=excluded.snapshot_ts,
+             snapshot_url=excluded.snapshot_url,
+             director_name=excluded.director_name,
+             other_names=excluded.other_names,
+             emails_on_page=excluded.emails_on_page,
+             page_title=excluded.page_title,
+             meta_description=excluded.meta_description,
+             mission_excerpt=excluded.mission_excerpt,
+             fetched_at=excluded.fetched_at""",
+        (
+            gs_id,
+            meta.get("snapshot_ts"),
+            meta.get("snapshot_url"),
+            meta.get("director_name"),
+            json.dumps(meta.get("other_names") or [], ensure_ascii=False),
+            json.dumps(meta.get("emails_on_page") or [], ensure_ascii=False),
+            meta.get("page_title"),
+            meta.get("meta_description"),
+            meta.get("mission_excerpt"),
+            now,
+        ),
+    )
+    record_event(db, gs_id, "snapshot_fetched", f"ts={meta.get('snapshot_ts')} director={meta.get('director_name')}")
+    db.commit()
+
+
+def get_snapshot_meta(db: sqlite3.Connection, identifier: str) -> dict[str, Any] | None:
+    row = db.execute(
+        """SELECT sm.* FROM snapshot_meta sm
+           JOIN targets t ON t.gs_id = sm.gs_id
+           WHERE t.gs_id=? OR t.root_domain=?""",
+        (identifier, identifier.lower()),
+    ).fetchone()
+    return dict(row) if row else None
